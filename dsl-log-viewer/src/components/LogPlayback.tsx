@@ -63,12 +63,11 @@ function ansiToBBCode(line: string): string {
 
   // decide which foreground colour a code sequence implies
   const pick = (codes: number[]): number | undefined => {
+    // explicit bright codes 90-97 win
     const bright = codes.find(c => 90 <= c && c <= 97);
     if (bright !== undefined) return bright;
-    if (codes.includes(1)) {            // bold + 30-37 → bright 90-97
-      const base = codes.find(c => 30 <= c && c <= 37);
-      if (base !== undefined) return base + 60;
-    }
+
+    // otherwise just keep the basic 30-37 colour, even if '1' (bold) is present
     return codes.find(c => 30 <= c && c <= 37);
   };
 
@@ -234,7 +233,7 @@ const LogPlaybackXterm: FC = () => {
   return (
     <div style={{ height: "100vh", display: "flex", flexDirection: "column" }}>
       <div style={{ padding: 8, background: "#222", color: "#fff" }}>
-        <input type="file" accept=".log" onChange={onFile} />
+        <input type="file" accept=".log,.txt" onChange={onFile} />
         {entries.length > 0 && (
           <>
             <button onClick={showWholeLog}>Show Whole Log</button>
