@@ -18,7 +18,6 @@ const tickTimer = 42;
 function parseLog(text: string): LogEntry[] {
   const raw: LogEntry[] = [];
   for (const line of text.split(/\r?\n/)) {
-    if (!line.trim()) continue;
     let obj: any;
     try {
       obj = JSON.parse(line);
@@ -33,8 +32,8 @@ function parseLog(text: string): LogEntry[] {
 
   // de-dupe (template-literal instead of accidental string concat)
   const seen = new Set<string>();
-  return raw.filter((e) => {
-    const key = `${e.ts.toISOString()}|${e.message}`;
+  return raw.filter((e, i) => {
+    const key = `${e.ts.toISOString()}|${e.message}|${i}`;
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
@@ -45,10 +44,23 @@ function parseLog(text: string): LogEntry[] {
 // 2. ansiToBBCode – converts ANSI SGR to nested-correct BBCode
 // ────────────────────────────────────────────────────────────────
 const ansiColorNames: Record<number, string> = {
-  30: "BLACK",   31: "RED",        32: "GREEN",      33: "YELLOW",
-  34: "BLUE",    35: "MAGENTA",    36: "CYAN",       37: "WHITE",
-  90: "BROWN",   91: "ORANGE",     92: "LIME GREEN", 93: "YELLOW",
-  94: "BLUE",    95: "MAGENTA",    96: "CYAN",       97: "WHITE",
+  30: "BLACK",
+  31: "RED",
+  32: "GREEN",
+  33: "YELLOW",
+  34: "BLUE",
+  35: "MAGENTA",
+  36: "CYAN",
+  37: "WHITE",
+  90: "BROWN",
+  91: "ORANGE",
+  92: "LIME GREEN",
+  93: "YELLOW",
+  94: "BLUE",
+  95: "MAGENTA",
+  96: "CYAN",
+  97: "WHITE",
+  38: "PURPLE",
 };
 
 /**
@@ -56,24 +68,32 @@ const ansiColorNames: Record<number, string> = {
  * Closes any existing [COLOR] before opening a new one, and handles reset (0).
  */
 function ansiToBBCode(line: string): string {
-  const esc = /\x1b\[([0-9;]+)m/g;      // SGR escape
-  let out   = "";
-  let last  = 0;
-  let open: string | null = null;       // currently open BBCode colour name
+  const esc = /\x1b\[([0-9;]+)m/g; // SGR escape
+  let out = "";
+  let last = 0;
+  let open: string | null = null; // currently open BBCode colour name
 
   // decide which foreground colour a code sequence implies
-  const pick = (codes: number[]): number | undefined => {
-    // explicit bright codes 90-97 win
-    const bright = codes.find(c => 90 <= c && c <= 97);
+  const pick = (codes: number[]): number | string | undefined => {
+    const bright = codes.find((c) => 90 <= c && c <= 97);
     if (bright !== undefined) return bright;
 
-    // otherwise just keep the basic 30-37 colour, even if '1' (bold) is present
-    return codes.find(c => 30 <= c && c <= 37);
+    const basic = codes.find((c) => 30 <= c && c <= 37);
+    if (basic !== undefined) return basic;
+
+    const i = codes.findIndex((c, idx) => c === 38 && codes[idx + 1] === 5);
+    if (i !== -1) {
+      const xterm = codes[i + 2];
+      if (xterm === 61) return "PURPLE";
+      return `XTERM-${xterm}`;
+    }
+
+    return undefined;
   };
 
   let m: RegExpExecArray | null;
   while ((m = esc.exec(line))) {
-    out += line.slice(last, m.index);   // text before this escape
+    out += line.slice(last, m.index); // text before this escape
     const codes = m[1].split(";").map(Number);
 
     // reset closes any open tag
@@ -84,9 +104,9 @@ function ansiToBBCode(line: string): string {
 
     const col = pick(codes);
     if (col !== undefined) {
-      const name = ansiColorNames[col];
+      const name = typeof col === "number" ? ansiColorNames[col] : col;
       if (name) {
-        const nextChar = line.charAt(esc.lastIndex);   // first printable char after the escape
+        const nextChar = line.charAt(esc.lastIndex); // first printable char after the escape
 
         /*-----------------------------------------------------------
           Web Wiz quirk: opening a tag immediately before ']' breaks
@@ -137,8 +157,8 @@ const LogPlaybackXterm: FC = () => {
   /** Copy the whole log as plain text (no colour codes) */
   const copyPlainText = () => {
     if (!entries.length) return;
-    const ansi = /\x1b\[[0-9;]*[A-Za-z]/g;     // remove any ESC[…letter
-    const txt = entries.map(e => e.message.replace(ansi, "")).join("\n");
+    const ansi = /\x1b\[[0-9;]*[A-Za-z]/g; // remove any ESC[…letter
+    const txt = entries.map((e) => e.message.replace(ansi, "")).join("\n");
     navigator.clipboard.writeText(txt);
   };
 
@@ -195,7 +215,8 @@ const LogPlaybackXterm: FC = () => {
     const nextIdx = entries.findIndex((e) => e.ts.getTime() > cutoff);
     const end = nextIdx === -1 ? entries.length : nextIdx;
     for (let i = lastIndexRef.current; i < end; i++) {
-      term.current?.writeln(entries[i].message);
+      const line = entries[i].message;
+      term.current?.writeln(line.length > 0 ? line : " ");
     }
     lastIndexRef.current = end;
   }, [time, entries]);
@@ -203,10 +224,16 @@ const LogPlaybackXterm: FC = () => {
   // show whole log in popup
   const showWholeLog = () => {
     if (!entries.length) return;
-    const w = window.open("", "_blank", "width=800,height=600,scrollbars=yes,resizable=yes");
+    const w = window.open(
+      "",
+      "_blank",
+      "width=800,height=600,scrollbars=yes,resizable=yes"
+    );
     if (!w) return;
     document
-      .querySelectorAll<HTMLLinkElement | HTMLStyleElement>('link[rel="stylesheet"], style')
+      .querySelectorAll<HTMLLinkElement | HTMLStyleElement>(
+        'link[rel="stylesheet"], style'
+      )
       .forEach((n) => w.document.head.appendChild(n.cloneNode(true)));
     Object.assign(w.document.body.style, { margin: "0", background: "#000" });
 
@@ -220,7 +247,10 @@ const LogPlaybackXterm: FC = () => {
     t2.open(container);
     f2.fit();
     w.addEventListener("resize", () => f2.fit());
-    entries.forEach((e) => t2.writeln(e.message));
+    entries.forEach((e) => {
+      const line = e.message;
+      t2.writeln(line === "" ? " " : line);
+    });
   };
 
   // copy raw log as BBCode
@@ -245,7 +275,9 @@ const LogPlaybackXterm: FC = () => {
             <button onClick={() => setTime((t) => Math.max(0, t - tickTimer))}>
               « {tickTimer}s
             </button>
-            <button onClick={() => setTime((t) => Math.min(duration, t + tickTimer))}>
+            <button
+              onClick={() => setTime((t) => Math.min(duration, t + tickTimer))}
+            >
               {tickTimer}s »
             </button>
             <span style={{ marginLeft: 12, color: "#aaa" }}>
