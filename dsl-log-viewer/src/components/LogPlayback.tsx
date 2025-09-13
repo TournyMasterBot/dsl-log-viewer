@@ -4,45 +4,104 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 
+interface DamageActorRow {
+  actor: string;
+  totalAsSource: number;
+  totalAsTarget: number;
+  countAsSource: number;
+  countAsTarget: number;
+}
+
+interface DamagePayload {
+  totalDamage: number;
+  hits: number;
+  misses: number;
+  events?: Array<{
+    raw: string;
+    source: string;
+    target: string;
+    verbKey: string;
+    amount: number;
+  }>;
+  bySource?: DamageActorRow[];
+  byTarget?: DamageActorRow[];
+}
+
+type EntryType = "dsl-message" | "damage";
+
 interface LogEntry {
   ts: Date;
-  message: string;
+  type: EntryType;
+  message?: string;        // for dsl-message
+  payload?: DamagePayload; // for damage
 }
 
 const tickTimer = 42;
+const FIVE_MIN_MS = 5 * 60 * 1000;
 
-// ────────────────────────────────────────────────────────────────
-// 1. parseLog – deduplicate with a proper template-literal key
-// Parses JSON‑lines, keeps only type==="dsl-message"
-// ────────────────────────────────────────────────────────────────
+/* ────────────────────────────────────────────────────────────────
+   Fit guards: only call fit() when opened + measurable + visible
+   ──────────────────────────────────────────────────────────────── */
+function safeFit(addon: FitAddon | null, t: Terminal | null, container: HTMLElement | null) {
+  if (!addon || !t || !container) return;
+  if (!t.element) return; // not opened yet
+  if (!container.isConnected) return;
+  const { clientWidth, clientHeight } = container;
+  if (clientWidth <= 0 || clientHeight <= 0) return;
+  try {
+    addon.fit();
+  } catch {
+    /* swallow */
+  }
+}
+
+/* ────────────────────────────────────────────────────────────────
+   parseLog – parse JSON-lines, keep dsl-message + damage
+   ──────────────────────────────────────────────────────────────── */
 function parseLog(text: string): LogEntry[] {
   const raw: LogEntry[] = [];
   for (const line of text.split(/\r?\n/)) {
+    if (!line.trim()) continue;
     let obj: any;
     try {
       obj = JSON.parse(line);
     } catch {
       continue;
     }
-    if (obj.type !== "dsl-message") continue;
-    raw.push({ ts: new Date(obj.timestamp), message: obj.payload });
+
+    if (obj.type === "dsl-message") {
+      raw.push({
+        ts: new Date(obj.timestamp),
+        type: "dsl-message",
+        message: obj.payload ?? "",
+      });
+    } else if (obj.type === "damage") {
+      raw.push({
+        ts: new Date(obj.timestamp),
+        type: "damage",
+        payload: obj.payload as DamagePayload,
+      });
+    }
   }
 
   raw.sort((a, b) => a.ts.getTime() - b.ts.getTime());
 
-  // de-dupe (template-literal instead of accidental string concat)
+  // De-dupe by timestamp + type + stable content
   const seen = new Set<string>();
-  return raw.filter((e, i) => {
-    const key = `${e.ts.toISOString()}|${e.message}|${i}`;
+  return raw.filter((e) => {
+    const key =
+      e.type === "dsl-message"
+        ? `${e.ts.toISOString()}|${e.type}|${e.message}`
+        : `${e.ts.toISOString()}|${e.type}|${e.payload?.totalDamage}|${e.payload?.hits}|${e.payload?.misses}`;
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
   });
 }
 
-// ────────────────────────────────────────────────────────────────
-// 2. ansiToBBCode – converts ANSI SGR to nested-correct BBCode
-// ────────────────────────────────────────────────────────────────
+/* ────────────────────────────────────────────────────────────────
+   ansiToBBCode – converts ANSI SGR to nested-correct BBCode
+   ──────────────────────────────────────────────────────────────── */
 const ansiColorNames: Record<number, string> = {
   30: "BLACK",
   31: "RED",
@@ -63,17 +122,12 @@ const ansiColorNames: Record<number, string> = {
   38: "PURPLE",
 };
 
-/**
- * Convert a single line with ANSI escapes into nested-correct BBCode.
- * Closes any existing [COLOR] before opening a new one, and handles reset (0).
- */
 function ansiToBBCode(line: string): string {
-  const esc = /\x1b\[([0-9;]+)m/g; // SGR escape
+  const esc = /\x1b\[([0-9;]+)m/g;
   let out = "";
   let last = 0;
-  let open: string | null = null; // currently open BBCode colour name
+  let open: string | null = null;
 
-  // decide which foreground colour a code sequence implies
   const pick = (codes: number[]): number | string | undefined => {
     const bright = codes.find((c) => 90 <= c && c <= 97);
     if (bright !== undefined) return bright;
@@ -93,10 +147,9 @@ function ansiToBBCode(line: string): string {
 
   let m: RegExpExecArray | null;
   while ((m = esc.exec(line))) {
-    out += line.slice(last, m.index); // text before this escape
+    out += line.slice(last, m.index);
     const codes = m[1].split(";").map(Number);
 
-    // reset closes any open tag
     if (codes.includes(0) && open) {
       out += "[/COLOR]";
       open = null;
@@ -106,26 +159,18 @@ function ansiToBBCode(line: string): string {
     if (col !== undefined) {
       const name = typeof col === "number" ? ansiColorNames[col] : col;
       if (name) {
-        const nextChar = line.charAt(esc.lastIndex); // first printable char after the escape
-
-        /*-----------------------------------------------------------
-          Web Wiz quirk: opening a tag immediately before ']' breaks
-          the parser.  When that happens we simply *skip* the colour
-          change and leave the current tag (if any) in place.
-        -----------------------------------------------------------*/
+        const nextChar = line.charAt(esc.lastIndex);
         if (nextChar !== "]") {
-          if (open) out += "[/COLOR]"; // close previous before switch
+          if (open) out += "[/COLOR]";
           out += `[COLOR=${name}]`;
           open = name;
         }
-        // else: skip the tag entirely
       }
     }
 
     last = esc.lastIndex;
   }
 
-  // tail after last escape
   out += line.slice(last);
   if (open) out += "[/COLOR]";
   return out;
@@ -145,6 +190,11 @@ const LogPlaybackXterm: FC = () => {
   const timer = useRef<number>(0);
   const lastIndexRef = useRef<number>(0);
 
+  // batching for damage
+  const lastDamageTsRef = useRef<number | null>(null);
+  const batchTotalsRef = useRef<Map<string, { total: number; count: number }>>(new Map());
+  const flushedFinalRef = useRef<boolean>(false);
+
   // file load
   const onFile = (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -154,29 +204,65 @@ const LogPlaybackXterm: FC = () => {
     reader.readAsText(file);
   };
 
-  /** Copy the whole log as plain text (no colour codes) */
+  /** Copy: plain text (round summaries only) */
   const copyPlainText = () => {
     if (!entries.length) return;
-    const ansi = /\x1b\[[0-9;]*[A-Za-z]/g; // remove any ESC[…letter
-    const txt = entries.map((e) => e.message.replace(ansi, "")).join("\n");
+    const ansi = /\x1b\[[0-9;]*[A-Za-z]/g;
+    const txt = entries
+      .map((e) => {
+        if (e.type === "dsl-message") return (e.message ?? "").replace(ansi, "");
+        if (e.type === "damage" && e.payload) {
+          const p = e.payload;
+          return `Damage Round: total=${p.totalDamage}, hits=${p.hits}, misses=${p.misses}`;
+        }
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n");
     navigator.clipboard.writeText(txt);
   };
 
-  // init xterm
+  // init xterm (robust fit)
   useEffect(() => {
-    term.current = new Terminal({ convertEol: true });
+    term.current = new Terminal({ convertEol: true } as any);
     fit.current = new FitAddon();
     term.current.loadAddon(fit.current);
-    if (termContainer.current) {
-      term.current.open(termContainer.current);
-      fit.current.fit();
+
+    const container = termContainer.current;
+    if (container) {
+      term.current.open(container);
+
+      requestAnimationFrame(() => safeFit(fit.current, term.current, container));
       term.current.writeln("⮞ Ready to load .log…");
+
+      const ro = new ResizeObserver(() => safeFit(fit.current, term.current, container));
+      ro.observe(container);
+
+      const io = new IntersectionObserver(
+        (entries) => {
+          for (const en of entries) if (en.isIntersecting) safeFit(fit.current, term.current, container);
+        },
+        { threshold: 0.01 }
+      );
+      io.observe(container);
+
+      const onResize = () => safeFit(fit.current, term.current, container);
+      window.addEventListener("resize", onResize);
+
+      return () => {
+        window.removeEventListener("resize", onResize);
+        io.disconnect();
+        ro.disconnect();
+        term.current?.dispose();
+        term.current = null;
+        fit.current = null;
+      };
     }
-    const onResize = () => fit.current?.fit();
-    window.addEventListener("resize", onResize);
+
     return () => {
-      window.removeEventListener("resize", onResize);
       term.current?.dispose();
+      term.current = null;
+      fit.current = null;
     };
   }, []);
 
@@ -190,6 +276,13 @@ const LogPlaybackXterm: FC = () => {
     setPlaying(false);
     lastIndexRef.current = 0;
     term.current?.clear();
+
+    // reset batch state
+    lastDamageTsRef.current = null;
+    batchTotalsRef.current.clear();
+    flushedFinalRef.current = false;
+
+    safeFit(fit.current, term.current, termContainer.current);
   }, [entries]);
 
   // playback clock
@@ -207,21 +300,91 @@ const LogPlaybackXterm: FC = () => {
     return () => clearInterval(timer.current);
   }, [playing, duration]);
 
-  // render log lines
+  // helpers for batching
+  const addToBatch = (rows?: DamageActorRow[]) => {
+    if (!rows || !rows.length) return;
+    const map = batchTotalsRef.current;
+    for (const r of rows) {
+      const cur = map.get(r.actor) ?? { total: 0, count: 0 };
+      cur.total += r.totalAsSource || 0;
+      cur.count += r.countAsSource || 0;
+      map.set(r.actor, cur);
+    }
+  };
+
+  const flushBatchTotals = (label: string) => {
+    const map = batchTotalsRef.current;
+    if (map.size === 0) return;
+    term.current?.writeln(label);
+    const rows = [...map.entries()].sort((a, b) => b[1].total - a[1].total);
+    for (const [actor, agg] of rows) {
+      term.current?.writeln(
+        `  - ${actor} → total ${Number(agg.total.toFixed(1))} dmg in ${agg.count} hits`
+      );
+    }
+    term.current?.writeln(""); // spacer
+    map.clear();
+  };
+
+  // render log lines with batching (NO per-event bullets)
   useEffect(() => {
     if (!entries.length) return;
     const base = entries[0].ts.getTime();
     const cutoff = base + time * 1000;
     const nextIdx = entries.findIndex((e) => e.ts.getTime() > cutoff);
     const end = nextIdx === -1 ? entries.length : nextIdx;
+
     for (let i = lastIndexRef.current; i < end; i++) {
-      const line = entries[i].message;
-      term.current?.writeln(line.length > 0 ? line : " ");
+      const entry = entries[i];
+
+      if (entry.type === "dsl-message") {
+        const line = entry.message ?? "";
+        term.current?.writeln(line.length > 0 ? line : " ");
+        continue;
+      }
+
+      if (entry.type === "damage" && entry.payload) {
+        const p = entry.payload;
+        const curTs = entry.ts.getTime();
+
+        // 5+ minute gap between damage rounds => flush batch
+        if (
+          lastDamageTsRef.current !== null &&
+          curTs - lastDamageTsRef.current >= FIVE_MIN_MS
+        ) {
+          flushBatchTotals("— Running totals by source (batch ended: 5+ min gap) —");
+        }
+
+        // Round header only
+        term.current?.writeln(
+          `⮞ Damage Round: total=${p.totalDamage}, hits=${p.hits}, misses=${p.misses}`
+        );
+
+        // Accumulate totals by source
+        addToBatch(p.bySource);
+
+        // Track last damage ts
+        lastDamageTsRef.current = curTs;
+
+        // Two blank lines after round
+        term.current?.writeln("");
+        term.current?.writeln("");
+      }
     }
+
     lastIndexRef.current = end;
+
+    // End-of-log flush
+    if (end === entries.length && !flushedFinalRef.current) {
+      flushBatchTotals("— Final totals by source —");
+      flushedFinalRef.current = true;
+    }
+    if (end !== entries.length) {
+      flushedFinalRef.current = false;
+    }
   }, [time, entries]);
 
-  // show whole log in popup
+  // popup (NO per-event bullets — mirrors terminal)
   const showWholeLog = () => {
     if (!entries.length) return;
     const w = window.open(
@@ -230,10 +393,9 @@ const LogPlaybackXterm: FC = () => {
       "width=800,height=600,scrollbars=yes,resizable=yes"
     );
     if (!w) return;
+
     document
-      .querySelectorAll<HTMLLinkElement | HTMLStyleElement>(
-        'link[rel="stylesheet"], style'
-      )
+      .querySelectorAll<HTMLLinkElement | HTMLStyleElement>('link[rel="stylesheet"], style')
       .forEach((n) => w.document.head.appendChild(n.cloneNode(true)));
     Object.assign(w.document.body.style, { margin: "0", background: "#000" });
 
@@ -245,18 +407,46 @@ const LogPlaybackXterm: FC = () => {
     const f2 = new FitAddon();
     t2.loadAddon(f2);
     t2.open(container);
-    f2.fit();
-    w.addEventListener("resize", () => f2.fit());
+
+    const fitPopup = () => {
+      try {
+        if (container.isConnected && container.clientWidth > 0 && container.clientHeight > 0) {
+          f2.fit();
+        }
+      } catch {}
+    };
+    w.requestAnimationFrame(fitPopup);
+    const ro = new (w as any).ResizeObserver(fitPopup);
+    ro.observe(container);
+    w.addEventListener("beforeunload", () => ro.disconnect());
+
     entries.forEach((e) => {
-      const line = e.message;
-      t2.writeln(line === "" ? " " : line);
+      if (e.type === "dsl-message") {
+        const line = e.message ?? "";
+        t2.writeln(line === "" ? " " : line);
+      } else if (e.type === "damage" && e.payload) {
+        const p = e.payload;
+        t2.writeln(`⮞ Damage Round: total=${p.totalDamage}, hits=${p.hits}, misses=${p.misses}`);
+        t2.writeln("");
+        t2.writeln("");
+      }
     });
   };
 
-  // copy raw log as BBCode
+  // copy as BBCode (round summaries only)
   const copyAsBBCode = () => {
     if (!entries.length) return;
-    const bb = entries.map((e) => ansiToBBCode(e.message)).join("\n");
+    const bb = entries
+      .map((e) => {
+        if (e.type === "dsl-message") return ansiToBBCode(e.message ?? "");
+        if (e.type === "damage" && e.payload) {
+          const p = e.payload;
+          return `[B]Damage Round:[/B] total=${p.totalDamage}, hits=${p.hits}, misses=${p.misses}`;
+        }
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n");
     navigator.clipboard.writeText(bb);
   };
 
@@ -275,9 +465,7 @@ const LogPlaybackXterm: FC = () => {
             <button onClick={() => setTime((t) => Math.max(0, t - tickTimer))}>
               « {tickTimer}s
             </button>
-            <button
-              onClick={() => setTime((t) => Math.min(duration, t + tickTimer))}
-            >
+            <button onClick={() => setTime((t) => Math.min(duration, t + tickTimer))}>
               {tickTimer}s »
             </button>
             <span style={{ marginLeft: 12, color: "#aaa" }}>
