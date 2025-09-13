@@ -8,21 +8,23 @@ interface DamageActorRow {
   actor: string;
   totalAsSource: number;
   totalAsTarget: number;
-  countAsSource: number;
+  countAsSource: number; // hits as source
   countAsTarget: number;
+}
+
+interface DamageEvent {
+  raw: string;
+  source: string;
+  target: string;
+  verbKey: string;
+  amount: number; // 0 => miss
 }
 
 interface DamagePayload {
   totalDamage: number;
   hits: number;
   misses: number;
-  events?: Array<{
-    raw: string;
-    source: string;
-    target: string;
-    verbKey: string;
-    amount: number;
-  }>;
+  events?: DamageEvent[];
   bySource?: DamageActorRow[];
   byTarget?: DamageActorRow[];
 }
@@ -32,61 +34,49 @@ type EntryType = "dsl-message" | "damage";
 interface LogEntry {
   ts: Date;
   type: EntryType;
-  message?: string;        // for dsl-message
-  payload?: DamagePayload; // for damage
+  message?: string;
+  payload?: DamagePayload;
 }
 
 const tickTimer = 42;
 const FIVE_MIN_MS = 5 * 60 * 1000;
 
 /* ────────────────────────────────────────────────────────────────
-   Fit guards: only call fit() when opened + measurable + visible
+   Fit guards
    ──────────────────────────────────────────────────────────────── */
 function safeFit(addon: FitAddon | null, t: Terminal | null, container: HTMLElement | null) {
   if (!addon || !t || !container) return;
-  if (!t.element) return; // not opened yet
+  if (!t.element) return;
   if (!container.isConnected) return;
   const { clientWidth, clientHeight } = container;
   if (clientWidth <= 0 || clientHeight <= 0) return;
-  try {
-    addon.fit();
-  } catch {
-    /* swallow */
-  }
+  try { addon.fit(); } catch {}
+}
+
+/* Strip the first leading "[ … ] " prefix, if present. */
+function normalizeActor(name: string): string {
+  return (name || "").replace(/^\s*\[[^\]]*]\s*/, "");
 }
 
 /* ────────────────────────────────────────────────────────────────
-   parseLog – parse JSON-lines, keep dsl-message + damage
+   parseLog – JSONL (dsl-message + damage)
    ──────────────────────────────────────────────────────────────── */
 function parseLog(text: string): LogEntry[] {
   const raw: LogEntry[] = [];
   for (const line of text.split(/\r?\n/)) {
     if (!line.trim()) continue;
     let obj: any;
-    try {
-      obj = JSON.parse(line);
-    } catch {
-      continue;
-    }
+    try { obj = JSON.parse(line); } catch { continue; }
 
     if (obj.type === "dsl-message") {
-      raw.push({
-        ts: new Date(obj.timestamp),
-        type: "dsl-message",
-        message: obj.payload ?? "",
-      });
+      raw.push({ ts: new Date(obj.timestamp), type: "dsl-message", message: obj.payload ?? "" });
     } else if (obj.type === "damage") {
-      raw.push({
-        ts: new Date(obj.timestamp),
-        type: "damage",
-        payload: obj.payload as DamagePayload,
-      });
+      raw.push({ ts: new Date(obj.timestamp), type: "damage", payload: obj.payload as DamagePayload });
     }
   }
 
   raw.sort((a, b) => a.ts.getTime() - b.ts.getTime());
 
-  // De-dupe by timestamp + type + stable content
   const seen = new Set<string>();
   return raw.filter((e) => {
     const key =
@@ -100,84 +90,45 @@ function parseLog(text: string): LogEntry[] {
 }
 
 /* ────────────────────────────────────────────────────────────────
-   ansiToBBCode – converts ANSI SGR to nested-correct BBCode
+   ANSI → BBCode (unchanged)
    ──────────────────────────────────────────────────────────────── */
 const ansiColorNames: Record<number, string> = {
-  30: "BLACK",
-  31: "RED",
-  32: "GREEN",
-  33: "YELLOW",
-  34: "BLUE",
-  35: "MAGENTA",
-  36: "CYAN",
-  37: "WHITE",
-  90: "BROWN",
-  91: "ORANGE",
-  92: "LIME GREEN",
-  93: "YELLOW",
-  94: "BLUE",
-  95: "MAGENTA",
-  96: "CYAN",
-  97: "WHITE",
+  30: "BLACK", 31: "RED", 32: "GREEN", 33: "YELLOW", 34: "BLUE", 35: "MAGENTA", 36: "CYAN", 37: "WHITE",
+  90: "BROWN", 91: "ORANGE", 92: "LIME GREEN", 93: "YELLOW", 94: "BLUE", 95: "MAGENTA", 96: "CYAN", 97: "WHITE",
   38: "PURPLE",
 };
-
 function ansiToBBCode(line: string): string {
   const esc = /\x1b\[([0-9;]+)m/g;
-  let out = "";
-  let last = 0;
-  let open: string | null = null;
-
+  let out = "", last = 0, open: string | null = null;
   const pick = (codes: number[]): number | string | undefined => {
-    const bright = codes.find((c) => 90 <= c && c <= 97);
-    if (bright !== undefined) return bright;
-
-    const basic = codes.find((c) => 30 <= c && c <= 37);
-    if (basic !== undefined) return basic;
-
+    const bright = codes.find((c) => 90 <= c && c <= 97); if (bright !== undefined) return bright;
+    const basic  = codes.find((c) => 30 <= c && c <= 37); if (basic  !== undefined) return basic;
     const i = codes.findIndex((c, idx) => c === 38 && codes[idx + 1] === 5);
-    if (i !== -1) {
-      const xterm = codes[i + 2];
-      if (xterm === 61) return "PURPLE";
-      return `XTERM-${xterm}`;
-    }
-
+    if (i !== -1) { const x = codes[i + 2]; if (x === 61) return "PURPLE"; return `XTERM-${x}`; }
     return undefined;
   };
-
   let m: RegExpExecArray | null;
   while ((m = esc.exec(line))) {
     out += line.slice(last, m.index);
     const codes = m[1].split(";").map(Number);
-
-    if (codes.includes(0) && open) {
-      out += "[/COLOR]";
-      open = null;
-    }
-
+    if (codes.includes(0) && open) { out += "[/COLOR]"; open = null; }
     const col = pick(codes);
     if (col !== undefined) {
       const name = typeof col === "number" ? ansiColorNames[col] : col;
       if (name) {
         const nextChar = line.charAt(esc.lastIndex);
-        if (nextChar !== "]") {
-          if (open) out += "[/COLOR]";
-          out += `[COLOR=${name}]`;
-          open = name;
-        }
+        if (nextChar !== "]") { if (open) out += "[/COLOR]"; out += `[COLOR=${name}]`; open = name; }
       }
     }
-
     last = esc.lastIndex;
   }
-
   out += line.slice(last);
   if (open) out += "[/COLOR]";
   return out;
 }
 
 const LogPlaybackXterm: FC = () => {
-  // state hooks
+  // state
   const [entries, setEntries] = useState<LogEntry[]>([]);
   const [duration, setDuration] = useState<number>(0);
   const [time, setTime] = useState<number>(0);
@@ -190,9 +141,15 @@ const LogPlaybackXterm: FC = () => {
   const timer = useRef<number>(0);
   const lastIndexRef = useRef<number>(0);
 
-  // batching for damage
+  // fight batching
   const lastDamageTsRef = useRef<number | null>(null);
-  const batchTotalsRef = useRef<Map<string, { total: number; count: number }>>(new Map());
+  const nextFlushDeadlineRef = useRef<number | null>(null); // absolute ms (wallclock of log)
+  const fightFlushedByTimerRef = useRef<boolean>(false);
+
+  type PerActor = { damage: number; hits: number; misses: number };
+  const byActorRef = useRef<Map<string, PerActor>>(new Map());
+  const totalsRef = useRef<{ damage: number; hits: number; misses: number }>({ damage: 0, hits: 0, misses: 0 });
+
   const flushedFinalRef = useRef<boolean>(false);
 
   // file load
@@ -204,46 +161,37 @@ const LogPlaybackXterm: FC = () => {
     reader.readAsText(file);
   };
 
-  /** Copy: plain text (round summaries only) */
+  // copy plain
   const copyPlainText = () => {
     if (!entries.length) return;
     const ansi = /\x1b\[[0-9;]*[A-Za-z]/g;
-    const txt = entries
-      .map((e) => {
-        if (e.type === "dsl-message") return (e.message ?? "").replace(ansi, "");
-        if (e.type === "damage" && e.payload) {
-          const p = e.payload;
-          return `Damage Round: total=${p.totalDamage}, hits=${p.hits}, misses=${p.misses}`;
-        }
-        return "";
-      })
-      .filter(Boolean)
-      .join("\n");
+    const txt = entries.map((e) => {
+      if (e.type === "dsl-message") return (e.message ?? "").replace(ansi, "");
+      if (e.type === "damage" && e.payload) {
+        const p = e.payload;
+        return `Damage Round: total=${p.totalDamage}, hits=${p.hits}, misses=${p.misses}`;
+      }
+      return "";
+    }).filter(Boolean).join("\n");
     navigator.clipboard.writeText(txt);
   };
 
-  // init xterm (robust fit)
+  // init xterm
   useEffect(() => {
     term.current = new Terminal({ convertEol: true } as any);
     fit.current = new FitAddon();
     term.current.loadAddon(fit.current);
-
     const container = termContainer.current;
     if (container) {
       term.current.open(container);
-
       requestAnimationFrame(() => safeFit(fit.current, term.current, container));
       term.current.writeln("⮞ Ready to load .log…");
 
       const ro = new ResizeObserver(() => safeFit(fit.current, term.current, container));
       ro.observe(container);
-
-      const io = new IntersectionObserver(
-        (entries) => {
-          for (const en of entries) if (en.isIntersecting) safeFit(fit.current, term.current, container);
-        },
-        { threshold: 0.01 }
-      );
+      const io = new IntersectionObserver((ents) => {
+        for (const en of ents) if (en.isIntersecting) safeFit(fit.current, term.current, container);
+      }, { threshold: 0.01 });
       io.observe(container);
 
       const onResize = () => safeFit(fit.current, term.current, container);
@@ -251,19 +199,11 @@ const LogPlaybackXterm: FC = () => {
 
       return () => {
         window.removeEventListener("resize", onResize);
-        io.disconnect();
-        ro.disconnect();
-        term.current?.dispose();
-        term.current = null;
-        fit.current = null;
+        io.disconnect(); ro.disconnect();
+        term.current?.dispose(); term.current = null; fit.current = null;
       };
     }
-
-    return () => {
-      term.current?.dispose();
-      term.current = null;
-      fit.current = null;
-    };
+    return () => { term.current?.dispose(); term.current = null; fit.current = null; };
   }, []);
 
   // reset on new entries
@@ -277,9 +217,12 @@ const LogPlaybackXterm: FC = () => {
     lastIndexRef.current = 0;
     term.current?.clear();
 
-    // reset batch state
+    // reset fight state
     lastDamageTsRef.current = null;
-    batchTotalsRef.current.clear();
+    nextFlushDeadlineRef.current = null;
+    fightFlushedByTimerRef.current = false;
+    byActorRef.current.clear();
+    totalsRef.current = { damage: 0, hits: 0, misses: 0 };
     flushedFinalRef.current = false;
 
     safeFit(fit.current, term.current, termContainer.current);
@@ -300,40 +243,95 @@ const LogPlaybackXterm: FC = () => {
     return () => clearInterval(timer.current);
   }, [playing, duration]);
 
-  // helpers for batching
-  const addToBatch = (rows?: DamageActorRow[]) => {
-    if (!rows || !rows.length) return;
-    const map = batchTotalsRef.current;
-    for (const r of rows) {
-      const cur = map.get(r.actor) ?? { total: 0, count: 0 };
-      cur.total += r.totalAsSource || 0;
-      cur.count += r.countAsSource || 0;
-      map.set(r.actor, cur);
+  /* ────────────────────────────────────────────────────────────────
+     Batching helpers (with per-source misses)
+     ──────────────────────────────────────────────────────────────── */
+  const addRoundToActors = (p: DamagePayload) => {
+    const map = byActorRef.current;
+
+    // Damage + hits from bySource if available
+    if (p.bySource && p.bySource.length) {
+      for (const row of p.bySource) {
+        const name = normalizeActor(row.actor || "");
+        const cur = map.get(name) ?? { damage: 0, hits: 0, misses: 0 };
+        cur.damage += row.totalAsSource || 0;
+        cur.hits += row.countAsSource || 0;
+        map.set(name, cur);
+      }
+    } else if (p.events && p.events.length) {
+      // Fallback to events if bySource missing
+      for (const ev of p.events) {
+        const name = normalizeActor(ev.source || "");
+        const cur = map.get(name) ?? { damage: 0, hits: 0, misses: 0 };
+        if (ev.amount > 0) { cur.damage += ev.amount || 0; cur.hits += 1; }
+        map.set(name, cur);
+      }
+    }
+
+    // Misses by source from events
+    if (p.events && p.events.length) {
+      for (const ev of p.events) {
+        if ((ev.amount ?? 0) === 0) {
+          const name = normalizeActor(ev.source || "");
+          const cur = map.get(name) ?? { damage: 0, hits: 0, misses: 0 };
+          cur.misses += 1;
+          map.set(name, cur);
+        }
+      }
     }
   };
 
-  const flushBatchTotals = (label: string) => {
-    const map = batchTotalsRef.current;
-    if (map.size === 0) return;
-    term.current?.writeln(label);
-    const rows = [...map.entries()].sort((a, b) => b[1].total - a[1].total);
-    for (const [actor, agg] of rows) {
-      term.current?.writeln(
-        `  - ${actor} → total ${Number(agg.total.toFixed(1))} dmg in ${agg.count} hits`
-      );
+  const addRoundToTotals = (p: DamagePayload) => {
+    const t = totalsRef.current;
+    t.damage += p.totalDamage || 0;
+    t.hits += p.hits || 0;
+    // Prefer payload.misses; if missing, count events amount==0
+    if (typeof p.misses === "number") {
+      t.misses += p.misses;
+    } else if (p.events) {
+      t.misses += p.events.filter(e => (e.amount ?? 0) === 0).length;
     }
-    term.current?.writeln(""); // spacer
+  };
+
+  const flushFightSummary = (label = "— Fight summary —") => {
+    const map = byActorRef.current;
+    const t = totalsRef.current;
+
+    if (map.size === 0 && t.damage === 0 && t.hits === 0 && t.misses === 0) return;
+
+    term.current?.writeln(
+      `${label} totalDamage=${Number(t.damage.toFixed(1))}, hits=${t.hits}, misses=${t.misses}`
+    );
+    if (map.size > 0) {
+      const rows = [...map.entries()].sort((a, b) => b[1].damage - a[1].damage);
+      for (const [actor, agg] of rows) {
+        term.current?.writeln(
+          `  - ${actor} → ${Number(agg.damage.toFixed(1))} dmg in ${agg.hits} hits, ${agg.misses} misses`
+        );
+      }
+    }
+    term.current?.writeln("");
+
+    // reset fight
     map.clear();
+    totalsRef.current = { damage: 0, hits: 0, misses: 0 };
+    lastDamageTsRef.current = null;
+    nextFlushDeadlineRef.current = null;
+    fightFlushedByTimerRef.current = true;
   };
 
-  // render log lines with batching (NO per-event bullets)
+  /* ────────────────────────────────────────────────────────────────
+     Playback render (including time-based gap flush)
+     ──────────────────────────────────────────────────────────────── */
   useEffect(() => {
     if (!entries.length) return;
+
     const base = entries[0].ts.getTime();
     const cutoff = base + time * 1000;
     const nextIdx = entries.findIndex((e) => e.ts.getTime() > cutoff);
     const end = nextIdx === -1 ? entries.length : nextIdx;
 
+    // 1) Emit new entries up to cutoff
     for (let i = lastIndexRef.current; i < end; i++) {
       const entry = entries[i];
 
@@ -347,26 +345,29 @@ const LogPlaybackXterm: FC = () => {
         const p = entry.payload;
         const curTs = entry.ts.getTime();
 
-        // 5+ minute gap between damage rounds => flush batch
+        // If this round occurs after a 5+ min gap since previous damage,
+        // immediately flush the PREVIOUS fight summary before printing this round.
         if (
           lastDamageTsRef.current !== null &&
-          curTs - lastDamageTsRef.current >= FIVE_MIN_MS
+          curTs - lastDamageTsRef.current >= FIVE_MIN_MS &&
+          byActorRef.current.size + totalsRef.current.damage + totalsRef.current.hits + totalsRef.current.misses > 0
         ) {
-          flushBatchTotals("— Running totals by source (batch ended: 5+ min gap) —");
+          flushFightSummary("— Fight summary —");
         }
 
-        // Round header only
-        term.current?.writeln(
-          `⮞ Damage Round: total=${p.totalDamage}, hits=${p.hits}, misses=${p.misses}`
-        );
+        // Print this round
+        term.current?.writeln(`⮞ Damage Round: total=${p.totalDamage}, hits=${p.hits}, misses=${p.misses}`);
 
-        // Accumulate totals by source
-        addToBatch(p.bySource);
+        // Accumulate (per-source + totals)
+        addRoundToActors(p);
+        addRoundToTotals(p);
 
-        // Track last damage ts
+        // Update fight timers
         lastDamageTsRef.current = curTs;
+        nextFlushDeadlineRef.current = curTs + FIVE_MIN_MS;
+        fightFlushedByTimerRef.current = false;
 
-        // Two blank lines after round
+        // Spacing
         term.current?.writeln("");
         term.current?.writeln("");
       }
@@ -374,9 +375,23 @@ const LogPlaybackXterm: FC = () => {
 
     lastIndexRef.current = end;
 
-    // End-of-log flush
+    // 2) Time-based gap flush:
+    // If we're *in playback time* past the nextFlushDeadline and the fight
+    // wasn't flushed already, flush it now (even if there were no new entries).
+    if (
+      nextFlushDeadlineRef.current !== null &&
+      cutoff >= nextFlushDeadlineRef.current &&
+      !fightFlushedByTimerRef.current &&
+      (byActorRef.current.size > 0 || totalsRef.current.damage > 0 || totalsRef.current.hits > 0 || totalsRef.current.misses > 0)
+    ) {
+      flushFightSummary("— Fight summary —");
+    }
+
+    // 3) End-of-log flush (if log fully shown and fight still open)
     if (end === entries.length && !flushedFinalRef.current) {
-      flushBatchTotals("— Final totals by source —");
+      if (byActorRef.current.size > 0 || totalsRef.current.damage > 0 || totalsRef.current.hits > 0 || totalsRef.current.misses > 0) {
+        flushFightSummary("— Fight summary —");
+      }
       flushedFinalRef.current = true;
     }
     if (end !== entries.length) {
@@ -384,18 +399,13 @@ const LogPlaybackXterm: FC = () => {
     }
   }, [time, entries]);
 
-  // popup (NO per-event bullets — mirrors terminal)
+  // popup viewer (kept to round headers only)
   const showWholeLog = () => {
     if (!entries.length) return;
-    const w = window.open(
-      "",
-      "_blank",
-      "width=800,height=600,scrollbars=yes,resizable=yes"
-    );
+    const w = window.open("", "_blank", "width=800,height=600,scrollbars=yes,resizable=yes");
     if (!w) return;
 
-    document
-      .querySelectorAll<HTMLLinkElement | HTMLStyleElement>('link[rel="stylesheet"], style')
+    document.querySelectorAll<HTMLLinkElement | HTMLStyleElement>('link[rel="stylesheet"], style')
       .forEach((n) => w.document.head.appendChild(n.cloneNode(true)));
     Object.assign(w.document.body.style, { margin: "0", background: "#000" });
 
@@ -409,11 +419,7 @@ const LogPlaybackXterm: FC = () => {
     t2.open(container);
 
     const fitPopup = () => {
-      try {
-        if (container.isConnected && container.clientWidth > 0 && container.clientHeight > 0) {
-          f2.fit();
-        }
-      } catch {}
+      try { if (container.isConnected && container.clientWidth > 0 && container.clientHeight > 0) f2.fit(); } catch {}
     };
     w.requestAnimationFrame(fitPopup);
     const ro = new (w as any).ResizeObserver(fitPopup);
@@ -433,20 +439,16 @@ const LogPlaybackXterm: FC = () => {
     });
   };
 
-  // copy as BBCode (round summaries only)
   const copyAsBBCode = () => {
     if (!entries.length) return;
-    const bb = entries
-      .map((e) => {
-        if (e.type === "dsl-message") return ansiToBBCode(e.message ?? "");
-        if (e.type === "damage" && e.payload) {
-          const p = e.payload;
-          return `[B]Damage Round:[/B] total=${p.totalDamage}, hits=${p.hits}, misses=${p.misses}`;
-        }
-        return "";
-      })
-      .filter(Boolean)
-      .join("\n");
+    const bb = entries.map((e) => {
+      if (e.type === "dsl-message") return ansiToBBCode(e.message ?? "");
+      if (e.type === "damage" && e.payload) {
+        const p = e.payload;
+        return `[B]Damage Round:[/B] total=${p.totalDamage}, hits=${p.hits}, misses=${p.misses}`;
+      }
+      return "";
+    }).filter(Boolean).join("\n");
     navigator.clipboard.writeText(bb);
   };
 
@@ -475,10 +477,7 @@ const LogPlaybackXterm: FC = () => {
           </>
         )}
       </div>
-      <div
-        ref={termContainer}
-        style={{ flex: 1, width: "100%", height: "100%", background: "#000" }}
-      />
+      <div ref={termContainer} style={{ flex: 1, width: "100%", height: "100%", background: "#000" }} />
     </div>
   );
 };
