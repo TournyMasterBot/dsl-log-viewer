@@ -41,9 +41,7 @@ interface LogEntry {
 const tickTimer = 42;
 const FIVE_MIN_MS = 5 * 60 * 1000;
 
-/* ────────────────────────────────────────────────────────────────
-   Fit guards
-   ──────────────────────────────────────────────────────────────── */
+/* Fit guards */
 function safeFit(addon: FitAddon | null, t: Terminal | null, container: HTMLElement | null) {
   if (!addon || !t || !container) return;
   if (!t.element) return;
@@ -58,9 +56,14 @@ function normalizeActor(name: string): string {
   return (name || "").replace(/^\s*\[[^\]]*]\s*/, "");
 }
 
-/* ────────────────────────────────────────────────────────────────
-   parseLog – JSONL (dsl-message + damage)
-   ──────────────────────────────────────────────────────────────── */
+/* number → 1-decimal, drop trailing .0 */
+function fmt1(n: number): string {
+  const v = Math.round((n ?? 0) * 10) / 10;
+  return Number.isFinite(v) ? (v % 1 === 0 ? String(v) : v.toFixed(1)) : "0";
+}
+
+/* Parse JSONL for dsl-message + damage
+   CHANGE: Only dsl-message lines are deduped; damage rounds are kept verbatim. */
 function parseLog(text: string): LogEntry[] {
   const raw: LogEntry[] = [];
   for (const line of text.split(/\r?\n/)) {
@@ -77,21 +80,21 @@ function parseLog(text: string): LogEntry[] {
 
   raw.sort((a, b) => a.ts.getTime() - b.ts.getTime());
 
+  // Dedupe ONLY dsl-message; keep ALL damage rounds (prevents accidental drops)
   const seen = new Set<string>();
-  return raw.filter((e) => {
-    const key =
-      e.type === "dsl-message"
-        ? `${e.ts.toISOString()}|${e.type}|${e.message}`
-        : `${e.ts.toISOString()}|${e.type}|${e.payload?.totalDamage}|${e.payload?.hits}|${e.payload?.misses}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+  const out: LogEntry[] = [];
+  for (const e of raw) {
+    if (e.type === "dsl-message") {
+      const key = `${e.ts.toISOString()}|${e.type}|${e.message}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+    }
+    out.push(e);
+  }
+  return out;
 }
 
-/* ────────────────────────────────────────────────────────────────
-   ANSI → BBCode (unchanged)
-   ──────────────────────────────────────────────────────────────── */
+/* ANSI → BBCode (unchanged) */
 const ansiColorNames: Record<number, string> = {
   30: "BLACK", 31: "RED", 32: "GREEN", 33: "YELLOW", 34: "BLUE", 35: "MAGENTA", 36: "CYAN", 37: "WHITE",
   90: "BROWN", 91: "ORANGE", 92: "LIME GREEN", 93: "YELLOW", 94: "BLUE", 95: "MAGENTA", 96: "CYAN", 97: "WHITE",
@@ -143,7 +146,7 @@ const LogPlaybackXterm: FC = () => {
 
   // fight batching
   const lastDamageTsRef = useRef<number | null>(null);
-  const nextFlushDeadlineRef = useRef<number | null>(null); // absolute ms (wallclock of log)
+  const nextFlushDeadlineRef = useRef<number | null>(null); // absolute ms (log clock of next fight-summary moment)
   const fightFlushedByTimerRef = useRef<boolean>(false);
 
   type PerActor = { damage: number; hits: number; misses: number };
@@ -161,19 +164,27 @@ const LogPlaybackXterm: FC = () => {
     reader.readAsText(file);
   };
 
-  // copy plain
+  // copy plain (round headers + per-round per-source lines)
   const copyPlainText = () => {
     if (!entries.length) return;
     const ansi = /\x1b\[[0-9;]*[A-Za-z]/g;
-    const txt = entries.map((e) => {
-      if (e.type === "dsl-message") return (e.message ?? "").replace(ansi, "");
-      if (e.type === "damage" && e.payload) {
+    const chunks: string[] = [];
+    for (const e of entries) {
+      if (e.type === "dsl-message") {
+        chunks.push((e.message ?? "").replace(ansi, "") || " ");
+      } else if (e.type === "damage" && e.payload) {
         const p = e.payload;
-        return `Damage Round: total=${p.totalDamage}, hits=${p.hits}, misses=${p.misses}`;
+        chunks.push(`⮞ Damage Round: total=${p.totalDamage}, hits=${p.hits}, misses=${p.misses}`);
+        const lines = buildRoundPerSourceLines(p);
+        if (lines.length) {
+          chunks.push("By source:");
+          lines.forEach(l => chunks.push(`  ${l}`));
+        }
+        chunks.push(""); // blank line
+        chunks.push("");
       }
-      return "";
-    }).filter(Boolean).join("\n");
-    navigator.clipboard.writeText(txt);
+    }
+    navigator.clipboard.writeText(chunks.join("\n"));
   };
 
   // init xterm
@@ -243,15 +254,46 @@ const LogPlaybackXterm: FC = () => {
     return () => clearInterval(timer.current);
   }, [playing, duration]);
 
-  /* ────────────────────────────────────────────────────────────────
-     Batching helpers (with per-source misses)
-     ──────────────────────────────────────────────────────────────── */
+  /* Build per-round per-source lines */
+  function buildRoundPerSourceLines(p: DamagePayload): string[] {
+    const per = new Map<string, { damage: number; hits: number; misses: number }>();
+    const hasBySource = !!(p.bySource && p.bySource.length);
+
+    if (hasBySource) {
+      for (const row of p.bySource!) {
+        const name = normalizeActor(row.actor || "");
+        const cur = per.get(name) ?? { damage: 0, hits: 0, misses: 0 };
+        cur.damage += row.totalAsSource || 0;
+        cur.hits += row.countAsSource || 0;
+        per.set(name, cur);
+      }
+    }
+
+    if (p.events && p.events.length) {
+      for (const ev of p.events) {
+        const name = normalizeActor(ev.source || "");
+        const cur = per.get(name) ?? { damage: 0, hits: 0, misses: 0 };
+        if (!hasBySource) {
+          if ((ev.amount ?? 0) > 0) { cur.damage += ev.amount || 0; cur.hits += 1; }
+        }
+        if ((ev.amount ?? 0) === 0) { cur.misses += 1; }
+        per.set(name, cur);
+      }
+    }
+
+    const arr = [...per.entries()]
+      .sort((a, b) => b[1].damage - a[1].damage || b[1].hits - a[1].hits)
+      .map(([actor, agg]) => `${actor}: ${fmt1(agg.damage)} dmg, ${agg.hits} hits, ${agg.misses} misses`);
+    return arr;
+  }
+
+  /* Fight batching helpers (with per-source misses) */
   const addRoundToActors = (p: DamagePayload) => {
     const map = byActorRef.current;
+    const hasBySource = !!(p.bySource && p.bySource.length);
 
-    // Damage + hits from bySource if available
-    if (p.bySource && p.bySource.length) {
-      for (const row of p.bySource) {
+    if (hasBySource) {
+      for (const row of p.bySource!) {
         const name = normalizeActor(row.actor || "");
         const cur = map.get(name) ?? { damage: 0, hits: 0, misses: 0 };
         cur.damage += row.totalAsSource || 0;
@@ -259,7 +301,6 @@ const LogPlaybackXterm: FC = () => {
         map.set(name, cur);
       }
     } else if (p.events && p.events.length) {
-      // Fallback to events if bySource missing
       for (const ev of p.events) {
         const name = normalizeActor(ev.source || "");
         const cur = map.get(name) ?? { damage: 0, hits: 0, misses: 0 };
@@ -268,7 +309,6 @@ const LogPlaybackXterm: FC = () => {
       }
     }
 
-    // Misses by source from events
     if (p.events && p.events.length) {
       for (const ev of p.events) {
         if ((ev.amount ?? 0) === 0) {
@@ -282,31 +322,40 @@ const LogPlaybackXterm: FC = () => {
   };
 
   const addRoundToTotals = (p: DamagePayload) => {
+    // NOTE: Totals are derived from the same basis we use per-actor to avoid mismatches.
     const t = totalsRef.current;
-    t.damage += p.totalDamage || 0;
-    t.hits += p.hits || 0;
-    // Prefer payload.misses; if missing, count events amount==0
-    if (typeof p.misses === "number") {
-      t.misses += p.misses;
-    } else if (p.events) {
+
+    if (p.bySource?.length) {
+      t.damage += p.bySource.reduce((s, r) => s + (r.totalAsSource || 0), 0);
+      t.hits   += p.bySource.reduce((s, r) => s + (r.countAsSource || 0), 0);
+    } else if (p.events?.length) {
+      for (const ev of p.events) {
+        if ((ev.amount ?? 0) > 0) { t.damage += ev.amount || 0; t.hits += 1; }
+      }
+    } else {
+      // Fallback to payload rollups (rare)
+      t.damage += p.totalDamage || 0;
+      t.hits   += p.hits || 0;
+    }
+
+    if (p.events?.length) {
       t.misses += p.events.filter(e => (e.amount ?? 0) === 0).length;
+    } else if (typeof p.misses === "number") {
+      t.misses += p.misses;
     }
   };
 
   const flushFightSummary = (label = "— Fight summary —") => {
     const map = byActorRef.current;
     const t = totalsRef.current;
-
     if (map.size === 0 && t.damage === 0 && t.hits === 0 && t.misses === 0) return;
 
-    term.current?.writeln(
-      `${label} totalDamage=${Number(t.damage.toFixed(1))}, hits=${t.hits}, misses=${t.misses}`
-    );
+    term.current?.writeln(`${label} totalDamage=${fmt1(t.damage)}, hits=${t.hits}, misses=${t.misses}`);
     if (map.size > 0) {
       const rows = [...map.entries()].sort((a, b) => b[1].damage - a[1].damage);
       for (const [actor, agg] of rows) {
         term.current?.writeln(
-          `  - ${actor} → ${Number(agg.damage.toFixed(1))} dmg in ${agg.hits} hits, ${agg.misses} misses`
+          `  ${actor}: ${fmt1(agg.damage)} dmg, ${agg.hits} hits, ${agg.misses} misses`
         );
       }
     }
@@ -320,9 +369,12 @@ const LogPlaybackXterm: FC = () => {
     fightFlushedByTimerRef.current = true;
   };
 
-  /* ────────────────────────────────────────────────────────────────
-     Playback render (including time-based gap flush)
-     ──────────────────────────────────────────────────────────────── */
+  /* Playback render (incl. per-round per-source lines + time-gap flush)
+     IMPORTANT for seeking/skips:
+     - We process ALL entries between lastIndexRef and the new cutoff, so jumping forward
+       (via » or dragging) counts every damage round crossed.
+     - If the jump crosses a 5+ min gap *without* hitting the next damage line yet, the
+       time-based flush below fires and prints the fight summary on time. */
   useEffect(() => {
     if (!entries.length) return;
 
@@ -345,24 +397,30 @@ const LogPlaybackXterm: FC = () => {
         const p = entry.payload;
         const curTs = entry.ts.getTime();
 
-        // If this round occurs after a 5+ min gap since previous damage,
-        // immediately flush the PREVIOUS fight summary before printing this round.
+        // If gap ≥ 5 min since previous damage, flush previous fight first
         if (
           lastDamageTsRef.current !== null &&
           curTs - lastDamageTsRef.current >= FIVE_MIN_MS &&
-          byActorRef.current.size + totalsRef.current.damage + totalsRef.current.hits + totalsRef.current.misses > 0
+          (byActorRef.current.size > 0 || totalsRef.current.damage > 0 || totalsRef.current.hits > 0 || totalsRef.current.misses > 0)
         ) {
           flushFightSummary("— Fight summary —");
         }
 
-        // Print this round
+        // Round header
         term.current?.writeln(`⮞ Damage Round: total=${p.totalDamage}, hits=${p.hits}, misses=${p.misses}`);
 
-        // Accumulate (per-source + totals)
+        // Per-round per-source lines
+        const lines = buildRoundPerSourceLines(p);
+        if (lines.length) {
+          term.current?.writeln("By source:");
+          lines.forEach(l => term.current?.writeln(`  ${l}`));
+        }
+
+        // Accumulate for fight
         addRoundToActors(p);
         addRoundToTotals(p);
 
-        // Update fight timers
+        // Timers
         lastDamageTsRef.current = curTs;
         nextFlushDeadlineRef.current = curTs + FIVE_MIN_MS;
         fightFlushedByTimerRef.current = false;
@@ -375,9 +433,7 @@ const LogPlaybackXterm: FC = () => {
 
     lastIndexRef.current = end;
 
-    // 2) Time-based gap flush:
-    // If we're *in playback time* past the nextFlushDeadline and the fight
-    // wasn't flushed already, flush it now (even if there were no new entries).
+    // 2) Time-based gap flush (no new entries required)
     if (
       nextFlushDeadlineRef.current !== null &&
       cutoff >= nextFlushDeadlineRef.current &&
@@ -387,7 +443,7 @@ const LogPlaybackXterm: FC = () => {
       flushFightSummary("— Fight summary —");
     }
 
-    // 3) End-of-log flush (if log fully shown and fight still open)
+    // 3) End-of-log flush
     if (end === entries.length && !flushedFinalRef.current) {
       if (byActorRef.current.size > 0 || totalsRef.current.damage > 0 || totalsRef.current.hits > 0 || totalsRef.current.misses > 0) {
         flushFightSummary("— Fight summary —");
@@ -399,7 +455,7 @@ const LogPlaybackXterm: FC = () => {
     }
   }, [time, entries]);
 
-  // popup viewer (kept to round headers only)
+  // popup viewer (round headers + per-round per-source lines)
   const showWholeLog = () => {
     if (!entries.length) return;
     const w = window.open("", "_blank", "width=800,height=600,scrollbars=yes,resizable=yes");
@@ -418,9 +474,7 @@ const LogPlaybackXterm: FC = () => {
     t2.loadAddon(f2);
     t2.open(container);
 
-    const fitPopup = () => {
-      try { if (container.isConnected && container.clientWidth > 0 && container.clientHeight > 0) f2.fit(); } catch {}
-    };
+    const fitPopup = () => { try { if (container.isConnected && container.clientWidth > 0 && container.clientHeight > 0) f2.fit(); } catch {} };
     w.requestAnimationFrame(fitPopup);
     const ro = new (w as any).ResizeObserver(fitPopup);
     ro.observe(container);
@@ -433,23 +487,37 @@ const LogPlaybackXterm: FC = () => {
       } else if (e.type === "damage" && e.payload) {
         const p = e.payload;
         t2.writeln(`⮞ Damage Round: total=${p.totalDamage}, hits=${p.hits}, misses=${p.misses}`);
+        const lines = buildRoundPerSourceLines(p);
+        if (lines.length) {
+          t2.writeln("By source:");
+          lines.forEach(l => t2.writeln(`  ${l}`));
+        }
         t2.writeln("");
         t2.writeln("");
       }
     });
   };
 
+  // copy as BBCode (round headers + per-round lines)
   const copyAsBBCode = () => {
     if (!entries.length) return;
-    const bb = entries.map((e) => {
-      if (e.type === "dsl-message") return ansiToBBCode(e.message ?? "");
-      if (e.type === "damage" && e.payload) {
+    const parts: string[] = [];
+    for (const e of entries) {
+      if (e.type === "dsl-message") {
+        parts.push(ansiToBBCode(e.message ?? ""));
+      } else if (e.type === "damage" && e.payload) {
         const p = e.payload;
-        return `[B]Damage Round:[/B] total=${p.totalDamage}, hits=${p.hits}, misses=${p.misses}`;
+        parts.push(`[B]Damage Round:[/B] total=${p.totalDamage}, hits=${p.hits}, misses=${p.misses}`);
+        const lines = buildRoundPerSourceLines(p);
+        if (lines.length) {
+          parts.push("[B]By source:[/B]");
+          lines.forEach(l => parts.push(`  ${l}`));
+        }
+        parts.push("");
+        parts.push("");
       }
-      return "";
-    }).filter(Boolean).join("\n");
-    navigator.clipboard.writeText(bb);
+    }
+    navigator.clipboard.writeText(parts.join("\n"));
   };
 
   return (
