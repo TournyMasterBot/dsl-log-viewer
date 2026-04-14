@@ -1,14 +1,18 @@
 // src/components/LogPlaybackXterm.tsx
-import React, { useState, useEffect, useRef, ChangeEvent, FC } from "react";
+import { useState, useEffect, useRef, ChangeEvent, FC } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
+import {
+  annotateRawData, buildFightSummaryLines, dmgColor, fmt1,
+  type DmgEvent,
+} from "../damageParser";
 
 interface DamageActorRow {
   actor: string;
   totalAsSource: number;
   totalAsTarget: number;
-  countAsSource: number; // hits as source
+  countAsSource: number;
   countAsTarget: number;
 }
 
@@ -29,7 +33,7 @@ interface DamagePayload {
   byTarget?: DamageActorRow[];
 }
 
-type EntryType = "dsl-message" | "damage";
+type EntryType = "dsl-message" | "damage" | "raw" | "client-input";
 
 interface LogEntry {
   ts: Date;
@@ -56,14 +60,10 @@ function normalizeActor(name: string): string {
   return (name || "").replace(/^\s*\[[^\]]*]\s*/, "");
 }
 
-/* number → 1-decimal, drop trailing .0 */
-function fmt1(n: number): string {
-  const v = Math.round((n ?? 0) * 10) / 10;
-  return Number.isFinite(v) ? (v % 1 === 0 ? String(v) : v.toFixed(1)) : "0";
-}
-
-/* Parse JSONL for dsl-message + damage
-   CHANGE: Only dsl-message lines are deduped; damage rounds are kept verbatim. */
+/* Parse JSONL — supports both formats:
+   Old: dsl-message, damage
+   New: game:remote-server:raw, game:client:input
+   Only dsl-message lines are deduped; all other entries are kept verbatim. */
 function parseLog(text: string): LogEntry[] {
   const raw: LogEntry[] = [];
   for (const line of text.split(/\r?\n/)) {
@@ -71,16 +71,27 @@ function parseLog(text: string): LogEntry[] {
     let obj: any;
     try { obj = JSON.parse(line); } catch { continue; }
 
+    const ts = new Date(obj.timestamp);
+
     if (obj.type === "dsl-message") {
-      raw.push({ ts: new Date(obj.timestamp), type: "dsl-message", message: obj.payload ?? "" });
+      raw.push({ ts, type: "dsl-message", message: obj.payload ?? "" });
     } else if (obj.type === "damage") {
-      raw.push({ ts: new Date(obj.timestamp), type: "damage", payload: obj.payload as DamagePayload });
+      raw.push({ ts, type: "damage", payload: obj.payload as DamagePayload });
+    } else if (obj.type === "game:remote-server:raw") {
+      const data: string = obj.payload?.data ?? "";
+      if (data) raw.push({ ts, type: "raw", message: data });
+    } else if (obj.type === "game:client:input") {
+      try {
+        const inp = typeof obj.payload === "string" ? JSON.parse(obj.payload) : obj.payload;
+        if (inp?.type === "data" && inp?.data) {
+          raw.push({ ts, type: "client-input", message: inp.data });
+        }
+      } catch { /* skip malformed */ }
     }
   }
 
   raw.sort((a, b) => a.ts.getTime() - b.ts.getTime());
 
-  // Dedupe ONLY dsl-message; keep ALL damage rounds (prevents accidental drops)
   const seen = new Set<string>();
   const out: LogEntry[] = [];
   for (const e of raw) {
@@ -94,7 +105,7 @@ function parseLog(text: string): LogEntry[] {
   return out;
 }
 
-/* ANSI → BBCode (unchanged) */
+/* ANSI → BBCode */
 const ansiColorNames: Record<number, string> = {
   30: "BLACK", 31: "RED", 32: "GREEN", 33: "YELLOW", 34: "BLUE", 35: "MAGENTA", 36: "CYAN", 37: "WHITE",
   90: "BROWN", 91: "ORANGE", 92: "LIME GREEN", 93: "YELLOW", 94: "BLUE", 95: "MAGENTA", 96: "CYAN", 97: "WHITE",
@@ -130,6 +141,89 @@ function ansiToBBCode(line: string): string {
   return out;
 }
 
+// ─── Round summary helpers ────────────────────────────────────────────────────
+
+const R      = '\x1b[0m';
+const CYAN   = '\x1b[0;36m';
+const YELLOW = '\x1b[0;33m';
+const GRAY   = '\x1b[2;37m';
+const MAGENTA= '\x1b[0;35m';
+
+/** Build per-source/target round summary lines from a DamagePayload. */
+function buildRoundLines(p: DamagePayload): string[] {
+  const lines: string[] = [];
+
+  // Collect events → source → { target → damage }
+  type PerSrc = { damage: number; hits: number; misses: number; targets: Map<string, number> };
+  const per = new Map<string, PerSrc>();
+  const hasBySource = !!(p.bySource && p.bySource.length);
+
+  if (hasBySource) {
+    for (const row of p.bySource!) {
+      const name = normalizeActor(row.actor || "");
+      const cur = per.get(name) ?? { damage: 0, hits: 0, misses: 0, targets: new Map() };
+      cur.damage += row.totalAsSource || 0;
+      cur.hits += row.countAsSource || 0;
+      per.set(name, cur);
+    }
+  }
+
+  if (p.events && p.events.length) {
+    for (const ev of p.events) {
+      const name = normalizeActor(ev.source || "");
+      const tgt  = normalizeActor(ev.target || "?");
+      const cur  = per.get(name) ?? { damage: 0, hits: 0, misses: 0, targets: new Map() };
+      if (!hasBySource && (ev.amount ?? 0) > 0) {
+        cur.damage += ev.amount || 0;
+        cur.hits   += 1;
+        cur.targets.set(tgt, (cur.targets.get(tgt) ?? 0) + (ev.amount || 0));
+      } else if ((ev.amount ?? 0) > 0) {
+        cur.targets.set(tgt, (cur.targets.get(tgt) ?? 0) + (ev.amount || 0));
+      }
+      if ((ev.amount ?? 0) === 0) cur.misses += 1;
+      per.set(name, cur);
+    }
+  }
+
+  const arr = [...per.entries()].sort((a, b) => b[1].damage - a[1].damage);
+  lines.push(`${CYAN}─── Round ──────────────────────────────${R}`);
+  for (const [actor, agg] of arr) {
+    lines.push(
+      `  ${YELLOW}${actor}${R}: ${dmgColor(agg.damage)}${fmt1(agg.damage)}${R} dmg` +
+      `  ${GRAY}·${R}  ${agg.hits} hits  ${GRAY}·${R}  ${agg.misses} misses`
+    );
+    const tgtsSorted = [...agg.targets.entries()].sort((a, b) => b[1] - a[1]);
+    for (const [tgt, dmg] of tgtsSorted) {
+      lines.push(`    ${GRAY}→${R} ${MAGENTA}${tgt}${R}: ${dmgColor(dmg)}${fmt1(dmg)}${R}`);
+    }
+  }
+  // total
+  const roundTotal = arr.reduce((s, [, a]) => s + a.damage, 0);
+  const roundHits  = arr.reduce((s, [, a]) => s + a.hits, 0);
+  const roundMisses= arr.reduce((s, [, a]) => s + a.misses, 0);
+  lines.push(
+    `  Total: ${dmgColor(roundTotal)}${fmt1(roundTotal)}${R} dmg` +
+    `  ${GRAY}·${R}  ${roundHits} hits  ${GRAY}·${R}  ${roundMisses} misses`
+  );
+  lines.push(`${CYAN}───────────────────────────────────────${R}`);
+  return lines;
+}
+
+/** Collect DmgEvent[] from a DamagePayload for fight-level aggregation. */
+function payloadToDmgEvents(p: DamagePayload): DmgEvent[] {
+  const events: DmgEvent[] = [];
+  if (!p.events) return events;
+  for (const ev of p.events) {
+    events.push({
+      source: normalizeActor(ev.source || "?"),
+      target: normalizeActor(ev.target || "?"),
+      key: ev.verbKey || "",
+      value: ev.amount ?? 0,
+    });
+  }
+  return events;
+}
+
 const LogPlaybackXterm: FC = () => {
   // state
   const [entries, setEntries] = useState<LogEntry[]>([]);
@@ -146,12 +240,14 @@ const LogPlaybackXterm: FC = () => {
 
   // fight batching
   const lastDamageTsRef = useRef<number | null>(null);
-  const nextFlushDeadlineRef = useRef<number | null>(null); // absolute ms (log clock of next fight-summary moment)
+  const nextFlushDeadlineRef = useRef<number | null>(null);
   const fightFlushedByTimerRef = useRef<boolean>(false);
 
-  type PerActor = { damage: number; hits: number; misses: number };
+  // per-actor fight accumulation (source → stats)
+  type PerActor = { damage: number; hits: number; misses: number; targets: Map<string, number> };
   const byActorRef = useRef<Map<string, PerActor>>(new Map());
-  const totalsRef = useRef<{ damage: number; hits: number; misses: number }>({ damage: 0, hits: 0, misses: 0 });
+  // raw DmgEvent list for fight summary (needed by buildFightSummaryLines)
+  const fightEventsRef = useRef<DmgEvent[]>([]);
 
   const flushedFinalRef = useRef<boolean>(false);
 
@@ -164,24 +260,21 @@ const LogPlaybackXterm: FC = () => {
     reader.readAsText(file);
   };
 
-  // copy plain (round headers + per-round per-source lines)
+  // copy plain
   const copyPlainText = () => {
     if (!entries.length) return;
     const ansi = /\x1b\[[0-9;]*[A-Za-z]/g;
     const chunks: string[] = [];
     for (const e of entries) {
-      if (e.type === "dsl-message") {
+      if (e.type === "raw") {
+        chunks.push((e.message ?? "").replace(ansi, ""));
+      } else if (e.type === "client-input") {
+        chunks.push(`> ${e.message ?? ""}`);
+      } else if (e.type === "dsl-message") {
         chunks.push((e.message ?? "").replace(ansi, "") || " ");
       } else if (e.type === "damage" && e.payload) {
         const p = e.payload;
         chunks.push(`⮞ Damage Round: total=${p.totalDamage}, hits=${p.hits}, misses=${p.misses}`);
-        const lines = buildRoundPerSourceLines(p);
-        if (lines.length) {
-          chunks.push("By source:");
-          lines.forEach(l => chunks.push(`  ${l}`));
-        }
-        chunks.push(""); // blank line
-        chunks.push("");
       }
     }
     navigator.clipboard.writeText(chunks.join("\n"));
@@ -228,12 +321,11 @@ const LogPlaybackXterm: FC = () => {
     lastIndexRef.current = 0;
     term.current?.clear();
 
-    // reset fight state
     lastDamageTsRef.current = null;
     nextFlushDeadlineRef.current = null;
     fightFlushedByTimerRef.current = false;
     byActorRef.current.clear();
-    totalsRef.current = { damage: 0, hits: 0, misses: 0 };
+    fightEventsRef.current = [];
     flushedFinalRef.current = false;
 
     safeFit(fit.current, term.current, termContainer.current);
@@ -254,40 +346,7 @@ const LogPlaybackXterm: FC = () => {
     return () => clearInterval(timer.current);
   }, [playing, duration]);
 
-  /* Build per-round per-source lines */
-  function buildRoundPerSourceLines(p: DamagePayload): string[] {
-    const per = new Map<string, { damage: number; hits: number; misses: number }>();
-    const hasBySource = !!(p.bySource && p.bySource.length);
-
-    if (hasBySource) {
-      for (const row of p.bySource!) {
-        const name = normalizeActor(row.actor || "");
-        const cur = per.get(name) ?? { damage: 0, hits: 0, misses: 0 };
-        cur.damage += row.totalAsSource || 0;
-        cur.hits += row.countAsSource || 0;
-        per.set(name, cur);
-      }
-    }
-
-    if (p.events && p.events.length) {
-      for (const ev of p.events) {
-        const name = normalizeActor(ev.source || "");
-        const cur = per.get(name) ?? { damage: 0, hits: 0, misses: 0 };
-        if (!hasBySource) {
-          if ((ev.amount ?? 0) > 0) { cur.damage += ev.amount || 0; cur.hits += 1; }
-        }
-        if ((ev.amount ?? 0) === 0) { cur.misses += 1; }
-        per.set(name, cur);
-      }
-    }
-
-    const arr = [...per.entries()]
-      .sort((a, b) => b[1].damage - a[1].damage || b[1].hits - a[1].hits)
-      .map(([actor, agg]) => `${actor}: ${fmt1(agg.damage)} dmg, ${agg.hits} hits, ${agg.misses} misses`);
-    return arr;
-  }
-
-  /* Fight batching helpers (with per-source misses) */
+  /* Accumulate round data into per-actor fight map */
   const addRoundToActors = (p: DamagePayload) => {
     const map = byActorRef.current;
     const hasBySource = !!(p.bySource && p.bySource.length);
@@ -295,86 +354,57 @@ const LogPlaybackXterm: FC = () => {
     if (hasBySource) {
       for (const row of p.bySource!) {
         const name = normalizeActor(row.actor || "");
-        const cur = map.get(name) ?? { damage: 0, hits: 0, misses: 0 };
+        const cur = map.get(name) ?? { damage: 0, hits: 0, misses: 0, targets: new Map() };
         cur.damage += row.totalAsSource || 0;
-        cur.hits += row.countAsSource || 0;
-        map.set(name, cur);
-      }
-    } else if (p.events && p.events.length) {
-      for (const ev of p.events) {
-        const name = normalizeActor(ev.source || "");
-        const cur = map.get(name) ?? { damage: 0, hits: 0, misses: 0 };
-        if (ev.amount > 0) { cur.damage += ev.amount || 0; cur.hits += 1; }
+        cur.hits   += row.countAsSource || 0;
         map.set(name, cur);
       }
     }
 
     if (p.events && p.events.length) {
       for (const ev of p.events) {
-        if ((ev.amount ?? 0) === 0) {
-          const name = normalizeActor(ev.source || "");
-          const cur = map.get(name) ?? { damage: 0, hits: 0, misses: 0 };
-          cur.misses += 1;
-          map.set(name, cur);
+        const name = normalizeActor(ev.source || "");
+        const tgt  = normalizeActor(ev.target || "?");
+        const cur  = map.get(name) ?? { damage: 0, hits: 0, misses: 0, targets: new Map() };
+        if (!hasBySource && (ev.amount ?? 0) > 0) {
+          cur.damage += ev.amount || 0;
+          cur.hits   += 1;
         }
+        if ((ev.amount ?? 0) > 0) {
+          cur.targets.set(tgt, (cur.targets.get(tgt) ?? 0) + (ev.amount || 0));
+        }
+        if ((ev.amount ?? 0) === 0) cur.misses += 1;
+        map.set(name, cur);
       }
     }
-  };
 
-  const addRoundToTotals = (p: DamagePayload) => {
-    // NOTE: Totals are derived from the same basis we use per-actor to avoid mismatches.
-    const t = totalsRef.current;
-
-    if (p.bySource?.length) {
-      t.damage += p.bySource.reduce((s, r) => s + (r.totalAsSource || 0), 0);
-      t.hits   += p.bySource.reduce((s, r) => s + (r.countAsSource || 0), 0);
-    } else if (p.events?.length) {
-      for (const ev of p.events) {
-        if ((ev.amount ?? 0) > 0) { t.damage += ev.amount || 0; t.hits += 1; }
-      }
-    } else {
-      // Fallback to payload rollups (rare)
-      t.damage += p.totalDamage || 0;
-      t.hits   += p.hits || 0;
-    }
-
-    if (p.events?.length) {
-      t.misses += p.events.filter(e => (e.amount ?? 0) === 0).length;
-    } else if (typeof p.misses === "number") {
-      t.misses += p.misses;
-    }
+    // Accumulate raw events for fight summary builder
+    fightEventsRef.current.push(...payloadToDmgEvents(p));
   };
 
   const flushFightSummary = (label = "— Fight summary —") => {
-    const map = byActorRef.current;
-    const t = totalsRef.current;
-    if (map.size === 0 && t.damage === 0 && t.hits === 0 && t.misses === 0) return;
+    const events = fightEventsRef.current;
+    if (events.length === 0 && byActorRef.current.size === 0) return;
 
-    term.current?.writeln(`${label} totalDamage=${fmt1(t.damage)}, hits=${t.hits}, misses=${t.misses}`);
-    if (map.size > 0) {
-      const rows = [...map.entries()].sort((a, b) => b[1].damage - a[1].damage);
-      for (const [actor, agg] of rows) {
-        term.current?.writeln(
-          `  ${actor}: ${fmt1(agg.damage)} dmg, ${agg.hits} hits, ${agg.misses} misses`
-        );
-      }
-    }
-    term.current?.writeln("");
+    const t = term.current;
+    if (!t) return;
+
+    t.writeln(`\x1b[1;36m${label}\x1b[0m`);
+
+    // Use the shared fight summary builder
+    const summaryLines = buildFightSummaryLines(events);
+    for (const l of summaryLines) t.writeln(l);
+    t.writeln("");
 
     // reset fight
-    map.clear();
-    totalsRef.current = { damage: 0, hits: 0, misses: 0 };
+    byActorRef.current.clear();
+    fightEventsRef.current = [];
     lastDamageTsRef.current = null;
     nextFlushDeadlineRef.current = null;
     fightFlushedByTimerRef.current = true;
   };
 
-  /* Playback render (incl. per-round per-source lines + time-gap flush)
-     IMPORTANT for seeking/skips:
-     - We process ALL entries between lastIndexRef and the new cutoff, so jumping forward
-       (via » or dragging) counts every damage round crossed.
-     - If the jump crosses a 5+ min gap *without* hitting the next damage line yet, the
-       time-based flush below fires and prints the fight summary on time. */
+  /* Playback render */
   useEffect(() => {
     if (!entries.length) return;
 
@@ -383,9 +413,32 @@ const LogPlaybackXterm: FC = () => {
     const nextIdx = entries.findIndex((e) => e.ts.getTime() > cutoff);
     const end = nextIdx === -1 ? entries.length : nextIdx;
 
-    // 1) Emit new entries up to cutoff
+    // Backward seek
+    if (end < lastIndexRef.current) {
+      term.current?.clear();
+      lastIndexRef.current = 0;
+      lastDamageTsRef.current = null;
+      nextFlushDeadlineRef.current = null;
+      fightFlushedByTimerRef.current = false;
+      byActorRef.current.clear();
+      fightEventsRef.current = [];
+      flushedFinalRef.current = false;
+    }
+
     for (let i = lastIndexRef.current; i < end; i++) {
       const entry = entries[i];
+
+      // New format: annotate damage lines in raw server output
+      if (entry.type === "raw") {
+        term.current?.write(annotateRawData(entry.message ?? ""));
+        continue;
+      }
+
+      // Player command annotation (dim)
+      if (entry.type === "client-input") {
+        term.current?.write(`\x1b[2m> ${entry.message}\x1b[0m\r\n`);
+        continue;
+      }
 
       if (entry.type === "dsl-message") {
         const line = entry.message ?? "";
@@ -397,55 +450,45 @@ const LogPlaybackXterm: FC = () => {
         const p = entry.payload;
         const curTs = entry.ts.getTime();
 
-        // If gap ≥ 5 min since previous damage, flush previous fight first
+        // Gap ≥ 5 min since previous damage → flush previous fight
         if (
           lastDamageTsRef.current !== null &&
           curTs - lastDamageTsRef.current >= FIVE_MIN_MS &&
-          (byActorRef.current.size > 0 || totalsRef.current.damage > 0 || totalsRef.current.hits > 0 || totalsRef.current.misses > 0)
+          (byActorRef.current.size > 0 || fightEventsRef.current.length > 0)
         ) {
           flushFightSummary("— Fight summary —");
         }
 
-        // Round header
-        term.current?.writeln(`⮞ Damage Round: total=${p.totalDamage}, hits=${p.hits}, misses=${p.misses}`);
-
-        // Per-round per-source lines
-        const lines = buildRoundPerSourceLines(p);
-        if (lines.length) {
-          term.current?.writeln("By source:");
-          lines.forEach(l => term.current?.writeln(`  ${l}`));
-        }
+        // Emit round summary
+        const roundLines = buildRoundLines(p);
+        for (const l of roundLines) term.current?.writeln(l);
 
         // Accumulate for fight
         addRoundToActors(p);
-        addRoundToTotals(p);
 
-        // Timers
         lastDamageTsRef.current = curTs;
         nextFlushDeadlineRef.current = curTs + FIVE_MIN_MS;
         fightFlushedByTimerRef.current = false;
 
-        // Spacing
-        term.current?.writeln("");
         term.current?.writeln("");
       }
     }
 
     lastIndexRef.current = end;
 
-    // 2) Time-based gap flush (no new entries required)
+    // Time-based gap flush
     if (
       nextFlushDeadlineRef.current !== null &&
       cutoff >= nextFlushDeadlineRef.current &&
       !fightFlushedByTimerRef.current &&
-      (byActorRef.current.size > 0 || totalsRef.current.damage > 0 || totalsRef.current.hits > 0 || totalsRef.current.misses > 0)
+      (byActorRef.current.size > 0 || fightEventsRef.current.length > 0)
     ) {
       flushFightSummary("— Fight summary —");
     }
 
-    // 3) End-of-log flush
+    // End-of-log flush
     if (end === entries.length && !flushedFinalRef.current) {
-      if (byActorRef.current.size > 0 || totalsRef.current.damage > 0 || totalsRef.current.hits > 0 || totalsRef.current.misses > 0) {
+      if (byActorRef.current.size > 0 || fightEventsRef.current.length > 0) {
         flushFightSummary("— Fight summary —");
       }
       flushedFinalRef.current = true;
@@ -455,7 +498,7 @@ const LogPlaybackXterm: FC = () => {
     }
   }, [time, entries]);
 
-  // popup viewer (round headers + per-round per-source lines)
+  // popup viewer
   const showWholeLog = () => {
     if (!entries.length) return;
     const w = window.open("", "_blank", "width=800,height=600,scrollbars=yes,resizable=yes");
@@ -480,40 +523,58 @@ const LogPlaybackXterm: FC = () => {
     ro.observe(container);
     w.addEventListener("beforeunload", () => ro.disconnect());
 
+    // Replay all entries with summaries into popup
+    const popupFightEvents: DmgEvent[] = [];
+    let popupLastDmgTs: number | null = null;
+
     entries.forEach((e) => {
-      if (e.type === "dsl-message") {
+      if (e.type === "raw") {
+        t2.write(annotateRawData(e.message ?? ""));
+      } else if (e.type === "client-input") {
+        t2.write(`\x1b[2m> ${e.message}\x1b[0m\r\n`);
+      } else if (e.type === "dsl-message") {
         const line = e.message ?? "";
         t2.writeln(line === "" ? " " : line);
       } else if (e.type === "damage" && e.payload) {
         const p = e.payload;
-        t2.writeln(`⮞ Damage Round: total=${p.totalDamage}, hits=${p.hits}, misses=${p.misses}`);
-        const lines = buildRoundPerSourceLines(p);
-        if (lines.length) {
-          t2.writeln("By source:");
-          lines.forEach(l => t2.writeln(`  ${l}`));
+        const curTs = e.ts.getTime();
+
+        if (popupLastDmgTs !== null && curTs - popupLastDmgTs >= FIVE_MIN_MS && popupFightEvents.length > 0) {
+          t2.writeln(`\x1b[1;36m— Fight summary —\x1b[0m`);
+          for (const l of buildFightSummaryLines(popupFightEvents)) t2.writeln(l);
+          t2.writeln("");
+          popupFightEvents.length = 0;
         }
-        t2.writeln("");
+
+        for (const l of buildRoundLines(p)) t2.writeln(l);
+        popupFightEvents.push(...payloadToDmgEvents(p));
+        popupLastDmgTs = curTs;
         t2.writeln("");
       }
     });
+
+    // Final fight summary in popup
+    if (popupFightEvents.length > 0) {
+      t2.writeln(`\x1b[1;36m— Fight summary —\x1b[0m`);
+      for (const l of buildFightSummaryLines(popupFightEvents)) t2.writeln(l);
+      t2.writeln("");
+    }
   };
 
-  // copy as BBCode (round headers + per-round lines)
+  // copy as BBCode
   const copyAsBBCode = () => {
     if (!entries.length) return;
     const parts: string[] = [];
     for (const e of entries) {
-      if (e.type === "dsl-message") {
+      if (e.type === "raw") {
+        parts.push(ansiToBBCode(e.message ?? ""));
+      } else if (e.type === "client-input") {
+        parts.push(`> ${e.message ?? ""}`);
+      } else if (e.type === "dsl-message") {
         parts.push(ansiToBBCode(e.message ?? ""));
       } else if (e.type === "damage" && e.payload) {
         const p = e.payload;
         parts.push(`[B]Damage Round:[/B] total=${p.totalDamage}, hits=${p.hits}, misses=${p.misses}`);
-        const lines = buildRoundPerSourceLines(p);
-        if (lines.length) {
-          parts.push("[B]By source:[/B]");
-          lines.forEach(l => parts.push(`  ${l}`));
-        }
-        parts.push("");
         parts.push("");
       }
     }
@@ -521,9 +582,9 @@ const LogPlaybackXterm: FC = () => {
   };
 
   return (
-    <div style={{ height: "100vh", display: "flex", flexDirection: "column" }}>
-      <div style={{ padding: 8, background: "#222", color: "#fff" }}>
-        <input type="file" accept=".log,.txt" onChange={onFile} />
+    <div style={{ height: "100%", display: "flex", flexDirection: "column" }}>
+      <div style={{ padding: 8, background: "#222", color: "#fff", flexShrink: 0 }}>
+        <input type="file" accept=".log,.txt,.jsonl" onChange={onFile} />
         {entries.length > 0 && (
           <>
             <button onClick={showWholeLog}>Show Whole Log</button>
@@ -539,13 +600,13 @@ const LogPlaybackXterm: FC = () => {
               {tickTimer}s »
             </button>
             <span style={{ marginLeft: 12, color: "#aaa" }}>
-              {new Date(time * 1000).toISOString().substr(11, 8)} /{" "}
-              {new Date(duration * 1000).toISOString().substr(11, 8)}
+              {new Date(time * 1000).toISOString().slice(11, 19)} /{" "}
+              {new Date(duration * 1000).toISOString().slice(11, 19)}
             </span>
           </>
         )}
       </div>
-      <div ref={termContainer} style={{ flex: 1, width: "100%", height: "100%", background: "#000" }} />
+      <div ref={termContainer} style={{ flex: 1, minHeight: 0, width: "100%", background: "#000" }} />
     </div>
   );
 };
