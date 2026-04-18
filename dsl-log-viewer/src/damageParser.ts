@@ -313,6 +313,79 @@ export function buildFightSummaryLines(allEvents: DmgEvent[]): string[] {
   return lines;
 }
 
+// ─── ANSI → HTML conversion ───────────────────────────────────────────────────
+
+// [normal, bold/bright] CSS color values for a dark-background terminal palette
+const ANSI_FG_CSS: Record<number, [string, string]> = {
+  30: ["#555555", "#555555"],
+  31: ["#cc0000", "#ff5555"],
+  32: ["#00aa00", "#55ff55"],
+  33: ["#aa5500", "#ffff55"],
+  34: ["#0000cc", "#5555ff"],
+  35: ["#aa00aa", "#ff55ff"],
+  36: ["#00aaaa", "#55ffff"],
+  37: ["#aaaaaa", "#ffffff"],
+};
+
+function escHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/**
+ * Converts ANSI SGR color codes in a line to HTML <span> elements with inline styles.
+ * Handles: reset (0), bold (1), dim (2), fg (30-37), bright fg (90-97).
+ * All text content is HTML-escaped.
+ */
+export function ansiToHtml(line: string): string {
+  const esc = /\x1b\[([0-9;]*)m/g;
+  let out = "";
+  let last = 0;
+  let spanOpen = false;
+
+  let m: RegExpExecArray | null;
+  while ((m = esc.exec(line))) {
+    out += escHtml(line.slice(last, m.index));
+    last = esc.lastIndex;
+    const codes = m[1] ? m[1].split(";").map(Number) : [0];
+
+    if (codes.includes(0) && spanOpen) { out += "</span>"; spanOpen = false; }
+
+    const bold      = codes.includes(1);
+    const dim       = codes.includes(2);
+    const bright90  = codes.find(c => c >= 90 && c <= 97);
+    const fg30      = codes.find(c => c >= 30 && c <= 37);
+
+    let color: string | null = null;
+    if (bright90 !== undefined) {
+      color = ANSI_FG_CSS[bright90 - 60]?.[1] ?? null;
+    } else if (fg30 !== undefined) {
+      color = (dim && fg30 === 37) ? "#777777" : (ANSI_FG_CSS[fg30]?.[bold ? 1 : 0] ?? null);
+    }
+
+    if (color) {
+      if (spanOpen) out += "</span>";
+      out += `<span style="color:${color}">`;
+      spanOpen = true;
+    }
+  }
+
+  out += escHtml(line.slice(last));
+  if (spanOpen) out += "</span>";
+  return out;
+}
+
+/**
+ * Wraps HTML lines in a dark-background <pre> block suitable for embedding or downloading.
+ */
+export function buildHtmlPage(htmlLines: string[]): string {
+  const body = htmlLines.join("\n");
+  return `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>
+body{background:#111;color:#ccc;margin:0;padding:8px}
+pre{font-family:'Courier New',Courier,monospace;font-size:13px;line-height:1.4;white-space:pre-wrap;word-break:break-all}
+</style></head><body><pre>${body}</pre></body></html>`;
+}
+
 /**
  * Annotates raw server data (may contain multiple \n-separated lines and ANSI codes).
  * Appends damage annotation after lines that contain a damage keyword, before the newline.

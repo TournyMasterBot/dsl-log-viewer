@@ -6,12 +6,13 @@ import "@xterm/xterm/css/xterm.css";
 import {
   parseDmgLine, dmgSource, dmgTarget, dmgColor, stripAnsi,
   dmgAnnotation, buildRoundSummaryLines, buildFightSummaryLines,
+  ansiToHtml, buildHtmlPage,
   type DmgEvent,
 } from "../damageParser";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-type Format = "rawlog" | "mudlet" | "plain";
+type Format = "rawlog" | "mudlet" | "plain" | "ansi";
 
 interface Entry {
   ts?: number;   // ms offset from first entry; undefined when no timestamps
@@ -32,6 +33,9 @@ function detectFormat(text: string): Format {
   if (rawlogHits >= Math.max(1, sample.length * 0.4)) return "rawlog";
   const mudletHits = sample.filter(l => /^\d{2}:\d{2}:\d{2}\.\d{3} /.test(l)).length;
   if (mudletHits >= Math.max(1, sample.length * 0.3)) return "mudlet";
+  // Detect ANSI color sequences — with ESC byte (\x1b[) OR ESC-stripped (literal [1;31m)
+  const ansiHits = sample.filter(l => /\x1b\[/.test(l) || /\[[0-9;]+m/.test(l)).length;
+  if (ansiHits >= Math.max(1, sample.length * 0.1)) return "ansi";
   return "plain";
 }
 
@@ -85,11 +89,21 @@ function parsePlain(text: string): Entry[] {
   return text.split(/\r?\n/).map(line => ({ text: line }));
 }
 
+// ANSI plain text: same as plain but restores the ESC byte that some loggers strip.
+// Handles both already-correct \x1b[ sequences and bare [N;Nm bracket sequences.
+function parseAnsi(text: string): Entry[] {
+  return text.split(/\r?\n/).map(line => ({
+    // Add \x1b before any [N;Nm that isn't already preceded by \x1b
+    text: line.replace(/(?<!\x1b)\[([0-9;]*)m/g, "\x1b[$1m"),
+  }));
+}
+
 function parseLog(text: string): Parsed {
   const format = detectFormat(text);
   const entries =
     format === "rawlog" ? parseRawlog(text) :
     format === "mudlet" ? parseMudlet(text) :
+    format === "ansi"   ? parseAnsi(text) :
     parsePlain(text);
   return { format, entries, hasTimestamps: entries.some(e => e.ts !== undefined) };
 }
@@ -172,6 +186,73 @@ function safeFit(addon: FitAddon | null, t: Terminal | null, el: HTMLElement | n
   try { addon.fit(); } catch {}
 }
 
+/** Middle-mouse autoscroll: single click activates, any click or Escape deactivates. */
+function enableMiddleScroll(el: HTMLElement, t: Terminal): () => void {
+  let active = false, originY = 0, currentY = 0, raf = 0;
+
+  const indicator = document.createElement("div");
+  Object.assign(indicator.style, {
+    position: "fixed", zIndex: "99999", pointerEvents: "none",
+    display: "none", transform: "translate(-50%, -50%)",
+  });
+  indicator.innerHTML = `<svg width="28" height="28" xmlns="http://www.w3.org/2000/svg">
+    <circle cx="14" cy="14" r="12" fill="rgba(0,0,0,0.65)" stroke="#bbb" stroke-width="1.5"/>
+    <polygon points="14,4 18,10 10,10" fill="#ddd"/>
+    <polygon points="14,24 18,18 10,18" fill="#ddd"/>
+    <line x1="8" y1="14" x2="20" y2="14" stroke="#888" stroke-width="1"/>
+  </svg>`;
+  document.body.appendChild(indicator);
+
+  const tick = () => {
+    if (!active) return;
+    const delta = currentY - originY;
+    const dead = 12;
+    if (Math.abs(delta) > dead) {
+      const lines = (delta - Math.sign(delta) * dead) / 35;
+      t.scrollLines(lines > 0 ? Math.ceil(lines) : Math.floor(lines));
+    }
+    raf = requestAnimationFrame(tick);
+  };
+
+  const activate = (cx: number, cy: number) => {
+    active = true; originY = currentY = cy;
+    indicator.style.display = "block";
+    indicator.style.left = cx + "px";
+    indicator.style.top  = cy + "px";
+    document.body.style.cursor = "none";
+    cancelAnimationFrame(raf); raf = requestAnimationFrame(tick);
+  };
+
+  const deactivate = () => {
+    active = false;
+    indicator.style.display = "none";
+    document.body.style.cursor = "";
+    cancelAnimationFrame(raf);
+  };
+
+  const onDown = (e: MouseEvent) => {
+    if (e.button === 1 && el.contains(e.target as Node)) {
+      e.preventDefault();
+      active ? deactivate() : activate(e.clientX, e.clientY);
+      return;
+    }
+    if (active) deactivate();
+  };
+  const onMove = (e: MouseEvent) => { currentY = e.clientY; };
+  const onKey  = (e: KeyboardEvent) => { if (active && e.key === "Escape") deactivate(); };
+
+  window.addEventListener("mousedown", onDown, { capture: true });
+  window.addEventListener("mousemove", onMove);
+  window.addEventListener("keydown",   onKey);
+  return () => {
+    window.removeEventListener("mousedown", onDown, { capture: true });
+    window.removeEventListener("mousemove", onMove);
+    window.removeEventListener("keydown",   onKey);
+    cancelAnimationFrame(raf);
+    indicator.remove();
+  };
+}
+
 // ─── Damage-tracking renderer ─────────────────────────────────────────────────
 
 const ROUND_GAP_MS  = 4_000;       // 4 s gap = new round (timestamped logs)
@@ -187,41 +268,49 @@ interface DmgTracker {
   hadRoundDmg: boolean;
 }
 
+interface RenderOpts {
+  skipAll:    boolean;  // skip inline annotations + round summaries + fight summaries
+  skipRounds: boolean;  // skip round summaries only (fight summary still shown)
+  skipInline: boolean;  // skip inline damage annotations only
+}
+
+const DEFAULT_OPTS: RenderOpts = { skipAll: false, skipRounds: false, skipInline: false };
+
 function newTracker(): DmgTracker {
   return { round: [], fight: [], lastDmgTs: null, hadRoundDmg: false };
 }
 
-function flushRound(t: Terminal, tracker: DmgTracker) {
+function flushRound(t: Terminal, tracker: DmgTracker, emit: boolean) {
   if (tracker.round.length === 0) return;
-  const lines = buildRoundSummaryLines(tracker.round);
-  for (const l of lines) t.writeln(l);
-  t.writeln("");
+  if (emit) {
+    const lines = buildRoundSummaryLines(tracker.round);
+    for (const l of lines) t.writeln(l);
+    t.writeln("");
+  }
   tracker.fight.push(...tracker.round);
   tracker.round = [];
   tracker.hadRoundDmg = false;
 }
 
-function flushFight(t: Terminal, tracker: DmgTracker) {
-  flushRound(t, tracker);
+function flushFight(t: Terminal, tracker: DmgTracker, opts: RenderOpts = DEFAULT_OPTS) {
+  const emitRound = !opts.skipAll && !opts.skipRounds;
+  flushRound(t, tracker, emitRound);
   if (tracker.fight.length === 0) return;
-  const lines = buildFightSummaryLines(tracker.fight);
-  for (const l of lines) t.writeln(l);
-  t.writeln("");
+  if (!opts.skipAll) {
+    const lines = buildFightSummaryLines(tracker.fight);
+    for (const l of lines) t.writeln(l);
+    t.writeln("");
+  }
   tracker.fight = [];
   tracker.lastDmgTs = null;
 }
 
-/**
- * Renders one entry to the terminal, handling damage annotations and
- * emitting round/fight summaries at the right moments.
- *
- * Returns the text string that was written (used for BBCode/plain copy).
- */
 function renderEntryTracked(
   t: Terminal,
   entry: Entry,
   format: Format,
   tracker: DmgTracker,
+  opts: RenderOpts = DEFAULT_OPTS,
 ): void {
   const plain = stripAnsi(entry.text);
   const ts = entry.ts;
@@ -230,13 +319,12 @@ function renderEntryTracked(
   if (ts !== undefined && tracker.lastDmgTs !== null) {
     const gap = ts - tracker.lastDmgTs;
     if (gap >= FIGHT_GAP_MS) {
-      flushFight(t, tracker);
+      flushFight(t, tracker, opts);
     } else if (gap >= ROUND_GAP_MS && tracker.hadRoundDmg) {
-      flushRound(t, tracker);
+      flushRound(t, tracker, !opts.skipAll && !opts.skipRounds);
     }
   }
 
-  // parseDmgLine strips ANSI internally, so entry.text works for all formats
   const dmg = parseDmgLine(entry.text);
 
   if (dmg) {
@@ -246,28 +334,26 @@ function renderEntryTracked(
     tracker.hadRoundDmg = true;
     if (ts !== undefined) tracker.lastDmgTs = ts;
 
+    const annotation = (opts.skipAll || opts.skipInline) ? "" : dmgAnnotation(dmg.value);
     let display: string;
-    if (format === "rawlog") {
-      // rawlog already has ANSI from the game server — append annotation only
-      display = entry.text + dmgAnnotation(dmg.value);
+    if (format === "rawlog" || format === "ansi") {
+      display = entry.text + annotation;
     } else {
-      // plain/mudlet: color only the damage keyword, not the whole line
       const col = dmgColor(dmg.value);
       display =
-        entry.text.slice(0, dmg.plainIndex) +
+        plain.slice(0, dmg.plainIndex) +
         col + dmg.key + "\x1b[0m" +
-        entry.text.slice(dmg.plainIndex + dmg.key.length) +
-        dmgAnnotation(dmg.value);
+        plain.slice(dmg.plainIndex + dmg.key.length) +
+        annotation;
     }
     t.writeln(display.length > 0 ? display : " ");
   } else {
-    // Plain text round boundary: blank line or prompt after damage
     if (ts === undefined && tracker.hadRoundDmg) {
       if (!plain.trim() || PROMPT_RE.test(plain)) {
-        flushRound(t, tracker);
+        flushRound(t, tracker, !opts.skipAll && !opts.skipRounds);
       }
     }
-    const raw = format === "rawlog" ? entry.text : colorize(entry.text);
+    const raw = (format === "rawlog" || format === "ansi") ? entry.text : colorize(entry.text);
     t.writeln(raw.length > 0 ? raw : " ");
   }
 }
@@ -280,6 +366,7 @@ const FORMAT_LABELS: Record<Format, string> = {
   rawlog: "DSL Raw Log (¤TS=…¤)",
   mudlet: "Mudlet timestamped",
   plain:  "Plain text",
+  ansi:   "Plain text (ANSI colors)",
 };
 
 const LogPasteViewer: FC = () => {
@@ -300,9 +387,15 @@ const LogPasteViewer: FC = () => {
   const timerRef     = useRef<number>(0);
   const lastIdxRef   = useRef(0);
 
+  // ── render options (checkboxes)
+  const [skipAll,    setSkipAll]    = useState(false);
+  const [skipRounds, setSkipRounds] = useState(false);
+  const [skipInline, setSkipInline] = useState(false);
+
   // ── damage tracking refs (persist across incremental renders)
-  const trackerRef   = useRef<DmgTracker>(newTracker());
+  const trackerRef    = useRef<DmgTracker>(newTracker());
   const endFlushedRef = useRef(false);
+  const prevOptsRef   = useRef<RenderOpts>(DEFAULT_OPTS);
 
   // ── init terminal
   useEffect(() => {
@@ -322,9 +415,11 @@ const LogPasteViewer: FC = () => {
     const io = new IntersectionObserver(ents => { for (const en of ents) if (en.isIntersecting) safeFit(f, t, el); }, { threshold: 0.01 });
     io.observe(el);
     window.addEventListener("resize", onResize);
+    const cleanupScroll = enableMiddleScroll(el, t);
     return () => {
       window.removeEventListener("resize", onResize);
       io.disconnect(); ro.disconnect();
+      cleanupScroll();
       t.dispose(); termRef.current = null; fitRef.current = null;
     };
   }, []);
@@ -342,15 +437,8 @@ const LogPasteViewer: FC = () => {
     safeFit(fitRef.current, termRef.current, containerRef.current);
 
     if (!p.hasTimestamps) {
-      // Render everything immediately — no playback for plain text
-      const t = termRef.current!;
-      const tracker = trackerRef.current;
-      for (const entry of p.entries) {
-        renderEntryTracked(t, entry, p.format, tracker);
-      }
-      // Flush any trailing round/fight at end of log
-      flushFight(t, tracker);
       setDuration(0);
+      // Rendering handled by the non-timestamped useEffect below
     } else {
       const last = p.entries[p.entries.length - 1].ts ?? 0;
       setDuration(last / 1000);
@@ -381,16 +469,38 @@ const LogPasteViewer: FC = () => {
   // stop at end
   useEffect(() => { if (time >= duration && duration > 0 && playing) setPlaying(false); }, [time, duration, playing]);
 
+  // ── render non-timestamped logs (re-runs when opts change)
+  useEffect(() => {
+    if (!parsed || parsed.hasTimestamps) return;
+    const t = termRef.current!;
+    t.clear();
+    const tracker = newTracker();
+    trackerRef.current = tracker;
+    const opts: RenderOpts = { skipAll, skipRounds, skipInline };
+    for (const entry of parsed.entries) {
+      renderEntryTracked(t, entry, parsed.format, tracker, opts);
+    }
+    flushFight(t, tracker, opts);
+  }, [parsed, skipAll, skipRounds, skipInline]);
+
   // ── render entries up to current time (playback mode)
   useEffect(() => {
     if (!parsed?.hasTimestamps || !parsed.entries.length) return;
+
+    const opts: RenderOpts = { skipAll, skipRounds, skipInline };
+    const prev = prevOptsRef.current;
+    const optsChanged =
+      opts.skipAll !== prev.skipAll ||
+      opts.skipRounds !== prev.skipRounds ||
+      opts.skipInline !== prev.skipInline;
+    prevOptsRef.current = opts;
 
     const cutoffMs = time * 1000;
     const nextIdx = parsed.entries.findIndex(e => (e.ts ?? 0) > cutoffMs);
     const end = nextIdx === -1 ? parsed.entries.length : nextIdx;
 
-    // Backward seek: clear and re-render from scratch
-    if (end < lastIdxRef.current) {
+    // Backward seek or opts changed: clear and re-render from scratch
+    if (end < lastIdxRef.current || optsChanged) {
       termRef.current?.clear();
       lastIdxRef.current = 0;
       trackerRef.current = newTracker();
@@ -401,39 +511,99 @@ const LogPasteViewer: FC = () => {
     const tracker = trackerRef.current;
 
     for (let i = lastIdxRef.current; i < end; i++) {
-      renderEntryTracked(t, parsed.entries[i], parsed.format, tracker);
+      renderEntryTracked(t, parsed.entries[i], parsed.format, tracker, opts);
     }
     lastIdxRef.current = end;
 
     // End-of-log flush
     if (end === parsed.entries.length && !endFlushedRef.current) {
-      flushFight(t, tracker);
+      flushFight(t, tracker, opts);
       endFlushedRef.current = true;
     }
     if (end !== parsed.entries.length) {
       endFlushedRef.current = false;
     }
-  }, [time, parsed]);
+  }, [time, parsed, skipAll, skipRounds, skipInline]);
 
-  // ── copy helpers
-  const stripAnsiLocal = (s: string) => s.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "");
+  // ── copy / download helpers
+
+  const downloadFile = (content: string, filename: string, mime = "text/plain;charset=utf-8") => {
+    const blob = new Blob([content], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click();
+    setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 100);
+  };
+
+  /** Writes text to clipboard; falls back to a file download if the API fails or the payload is too large. */
+  const safeWrite = async (content: string, filename: string) => {
+    try {
+      await navigator.clipboard.writeText(content);
+    } catch {
+      const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = filename;
+      document.body.appendChild(a); a.click();
+      setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 100);
+    }
+  };
+
+  const useRaw = (fmt: Format) => fmt === "rawlog" || fmt === "ansi";
 
   const copyPlainText = () => {
     if (!parsed) return;
     const lines = parsed.entries.map(e =>
-      parsed.format === "rawlog"
-        ? stripAnsiLocal(e.text)
-        : stripAnsiLocal(colorize(e.text))
+      stripAnsi(useRaw(parsed.format) ? e.text : colorize(e.text))
     );
-    navigator.clipboard.writeText(lines.join("\n"));
+    safeWrite(lines.join("\n"), "log.txt");
   };
 
   const copyBBCode = () => {
     if (!parsed) return;
     const lines = parsed.entries.map(e =>
-      parsed.format === "rawlog" ? ansiToBBCode(e.text) : ansiToBBCode(colorize(e.text))
+      ansiToBBCode(useRaw(parsed.format) ? e.text : colorize(e.text))
     );
-    navigator.clipboard.writeText(lines.join("\n"));
+    safeWrite(lines.join("\n"), "log-bbcode.txt");
+  };
+
+  const downloadBBCode = () => {
+    if (!parsed) return;
+    const lines = parsed.entries.map(e =>
+      ansiToBBCode(useRaw(parsed.format) ? e.text : colorize(e.text))
+    );
+    downloadFile(lines.join("\n"), "log-bbcode.txt");
+  };
+
+  const copyHtml = async () => {
+    if (!parsed) return;
+    const htmlLines = parsed.entries.map(e =>
+      ansiToHtml(useRaw(parsed.format) ? e.text : colorize(e.text))
+    );
+    const fragment = `<pre style="background:#111;color:#ccc;font-family:'Courier New',Courier,monospace;font-size:13px;line-height:1.4;padding:8px;white-space:pre-wrap">\n${htmlLines.join("\n")}\n</pre>`;
+    // Try rich-text clipboard (text/html MIME), allowing paste into HTML-aware editors
+    try {
+      if (typeof ClipboardItem !== "undefined") {
+        await navigator.clipboard.write([
+          new ClipboardItem({
+            "text/html":  new Blob([fragment],  { type: "text/html" }),
+            "text/plain": new Blob([fragment],  { type: "text/plain" }),
+          }),
+        ]);
+        return;
+      }
+    } catch { /* fall through */ }
+    // Fallback: copy HTML source as plain text, or download
+    await safeWrite(buildHtmlPage(htmlLines), "log.html");
+  };
+
+  const downloadHtml = () => {
+    if (!parsed) return;
+    const htmlLines = parsed.entries.map(e =>
+      ansiToHtml(useRaw(parsed.format) ? e.text : colorize(e.text))
+    );
+    downloadFile(buildHtmlPage(htmlLines), "log.html", "text/html;charset=utf-8");
   };
 
   // ── popup "show whole log"
@@ -457,11 +627,12 @@ const LogPasteViewer: FC = () => {
     ro.observe(el);
     w.addEventListener("beforeunload", () => ro.disconnect());
 
+    const opts: RenderOpts = { skipAll, skipRounds, skipInline };
     const popupTracker = newTracker();
     for (const entry of parsed.entries) {
-      renderEntryTracked(t2, entry, parsed.format, popupTracker);
+      renderEntryTracked(t2, entry, parsed.format, popupTracker, opts);
     }
-    flushFight(t2, popupTracker);
+    flushFight(t2, popupTracker, opts);
   };
 
   const fmtTime = (s: number) => new Date(s * 1000).toISOString().substr(11, 8);
@@ -533,9 +704,24 @@ const LogPasteViewer: FC = () => {
         {/* Toolbar */}
         {hasData && (
           <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
-            <button onClick={showWholeLog} style={btnStyle}>Show Whole Log</button>
-            <button onClick={copyBBCode}   style={btnStyle}>Copy BBCode</button>
+            <button onClick={showWholeLog}  style={btnStyle}>Show Whole Log</button>
+            <button onClick={copyHtml}      style={btnStyle}>Copy HTML</button>
+            <button onClick={downloadHtml}  style={btnStyle}>Download HTML</button>
+            <button onClick={copyBBCode}    style={btnStyle}>Copy BBCode</button>
+            <button onClick={downloadBBCode} style={btnStyle}>Download BBCode</button>
             <button onClick={copyPlainText} style={btnStyle}>Copy Plain Text</button>
+            <span style={{ marginLeft: 4, borderLeft: "1px solid #444", paddingLeft: 8, display: "flex", gap: 12, alignItems: "center" }}>
+              {([
+                ["skipAll",    skipAll,    setSkipAll,    "Skip damage summaries"] as const,
+                ["skipRounds", skipRounds, setSkipRounds, "Skip round summaries"]  as const,
+                ["skipInline", skipInline, setSkipInline, "Skip inline summaries"] as const,
+              ]).map(([id, val, set, label]) => (
+                <label key={id} style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "#bbb", cursor: "pointer", userSelect: "none" }}>
+                  <input type="checkbox" checked={val} onChange={e => set(e.target.checked)} style={{ cursor: "pointer" }} />
+                  {label}
+                </label>
+              ))}
+            </span>
             {showPlayback && (
               <>
                 <button onClick={() => setPlaying(p => !p)} style={btnStyle}>

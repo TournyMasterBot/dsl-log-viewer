@@ -5,6 +5,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import {
   annotateRawData, buildFightSummaryLines, dmgColor, fmt1,
+  ansiToHtml, buildHtmlPage, stripAnsi,
   type DmgEvent,
 } from "../damageParser";
 
@@ -53,6 +54,73 @@ function safeFit(addon: FitAddon | null, t: Terminal | null, container: HTMLElem
   const { clientWidth, clientHeight } = container;
   if (clientWidth <= 0 || clientHeight <= 0) return;
   try { addon.fit(); } catch {}
+}
+
+/** Middle-mouse autoscroll: single click activates, any click or Escape deactivates. */
+function enableMiddleScroll(el: HTMLElement, t: Terminal): () => void {
+  let active = false, originY = 0, currentY = 0, raf = 0;
+
+  const indicator = document.createElement("div");
+  Object.assign(indicator.style, {
+    position: "fixed", zIndex: "99999", pointerEvents: "none",
+    display: "none", transform: "translate(-50%, -50%)",
+  });
+  indicator.innerHTML = `<svg width="28" height="28" xmlns="http://www.w3.org/2000/svg">
+    <circle cx="14" cy="14" r="12" fill="rgba(0,0,0,0.65)" stroke="#bbb" stroke-width="1.5"/>
+    <polygon points="14,4 18,10 10,10" fill="#ddd"/>
+    <polygon points="14,24 18,18 10,18" fill="#ddd"/>
+    <line x1="8" y1="14" x2="20" y2="14" stroke="#888" stroke-width="1"/>
+  </svg>`;
+  document.body.appendChild(indicator);
+
+  const tick = () => {
+    if (!active) return;
+    const delta = currentY - originY;
+    const dead = 12;
+    if (Math.abs(delta) > dead) {
+      const lines = (delta - Math.sign(delta) * dead) / 35;
+      t.scrollLines(lines > 0 ? Math.ceil(lines) : Math.floor(lines));
+    }
+    raf = requestAnimationFrame(tick);
+  };
+
+  const activate = (cx: number, cy: number) => {
+    active = true; originY = currentY = cy;
+    indicator.style.display = "block";
+    indicator.style.left = cx + "px";
+    indicator.style.top  = cy + "px";
+    document.body.style.cursor = "none";
+    cancelAnimationFrame(raf); raf = requestAnimationFrame(tick);
+  };
+
+  const deactivate = () => {
+    active = false;
+    indicator.style.display = "none";
+    document.body.style.cursor = "";
+    cancelAnimationFrame(raf);
+  };
+
+  const onDown = (e: MouseEvent) => {
+    if (e.button === 1 && el.contains(e.target as Node)) {
+      e.preventDefault();
+      active ? deactivate() : activate(e.clientX, e.clientY);
+      return;
+    }
+    if (active) deactivate();
+  };
+  const onMove = (e: MouseEvent) => { currentY = e.clientY; };
+  const onKey  = (e: KeyboardEvent) => { if (active && e.key === "Escape") deactivate(); };
+
+  window.addEventListener("mousedown", onDown, { capture: true });
+  window.addEventListener("mousemove", onMove);
+  window.addEventListener("keydown",   onKey);
+  return () => {
+    window.removeEventListener("mousedown", onDown, { capture: true });
+    window.removeEventListener("mousemove", onMove);
+    window.removeEventListener("keydown",   onKey);
+    cancelAnimationFrame(raf);
+    indicator.remove();
+  };
 }
 
 /* Strip the first leading "[ … ] " prefix, if present. */
@@ -230,6 +298,7 @@ const LogPlaybackXterm: FC = () => {
   const [duration, setDuration] = useState<number>(0);
   const [time, setTime] = useState<number>(0);
   const [playing, setPlaying] = useState<boolean>(false);
+  const [playbackActive, setPlaybackActive] = useState<boolean>(false);
 
   // refs
   const termContainer = useRef<HTMLDivElement>(null);
@@ -251,6 +320,51 @@ const LogPlaybackXterm: FC = () => {
 
   const flushedFinalRef = useRef<boolean>(false);
 
+  /** Render every entry (with round + fight summaries) into the given terminal. */
+  const renderAllEntries = (t: Terminal, ents: LogEntry[]) => {
+    const fightEvents: DmgEvent[] = [];
+    let lastDmgTs: number | null = null;
+
+    const flushFight = () => {
+      if (fightEvents.length === 0) return;
+      t.writeln("\x1b[1;36m— Fight summary —\x1b[0m");
+      for (const l of buildFightSummaryLines(fightEvents)) t.writeln(l);
+      t.writeln("");
+      fightEvents.length = 0;
+      lastDmgTs = null;
+    };
+
+    for (const e of ents) {
+      if (e.type === "raw") {
+        t.write(annotateRawData(e.message ?? ""));
+      } else if (e.type === "client-input") {
+        t.write(`\x1b[2m> ${e.message}\x1b[0m\r\n`);
+      } else if (e.type === "dsl-message") {
+        const line = e.message ?? "";
+        t.writeln(line === "" ? " " : line);
+      } else if (e.type === "damage" && e.payload) {
+        const curTs = e.ts.getTime();
+        if (lastDmgTs !== null && curTs - lastDmgTs >= FIVE_MIN_MS) flushFight();
+        for (const l of buildRoundLines(e.payload)) t.writeln(l);
+        fightEvents.push(...payloadToDmgEvents(e.payload));
+        lastDmgTs = curTs;
+        t.writeln("");
+      }
+    }
+    flushFight();
+  };
+
+  /** Reset all playback-tracking refs to their initial state. */
+  const resetPlaybackRefs = () => {
+    lastIndexRef.current = 0;
+    lastDamageTsRef.current = null;
+    nextFlushDeadlineRef.current = null;
+    fightFlushedByTimerRef.current = false;
+    byActorRef.current.clear();
+    fightEventsRef.current = [];
+    flushedFinalRef.current = false;
+  };
+
   // file load
   const onFile = (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -260,24 +374,67 @@ const LogPlaybackXterm: FC = () => {
     reader.readAsText(file);
   };
 
+  /** Writes text to clipboard; falls back to file download if the API fails. */
+  const safeWrite = async (content: string, filename: string) => {
+    try {
+      await navigator.clipboard.writeText(content);
+    } catch {
+      downloadFile(content, filename);
+    }
+  };
+
+  const downloadFile = (content: string, filename: string, mime = "text/plain;charset=utf-8") => {
+    const blob = new Blob([content], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click();
+    setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 100);
+  };
+
+  /**
+   * Walks all entries in the same order as the playback renderer and produces
+   * ANSI-tagged lines — including round summaries and fight summaries.
+   * Callers convert to plain / BBCode / HTML as needed.
+   */
+  const collectAnsiLines = (): string[] => {
+    const lines: string[] = [];
+    const fightEvents: DmgEvent[] = [];
+    let lastDmgTs: number | null = null;
+
+    const flushFight = () => {
+      if (fightEvents.length === 0) return;
+      lines.push("\x1b[1;36m— Fight summary —\x1b[0m");
+      for (const l of buildFightSummaryLines(fightEvents)) lines.push(l);
+      lines.push("");
+      fightEvents.length = 0;
+      lastDmgTs = null;
+    };
+
+    for (const e of entries) {
+      if (e.type === "raw") {
+        for (const l of (e.message ?? "").split(/\r?\n/)) lines.push(l);
+      } else if (e.type === "client-input") {
+        lines.push(`\x1b[2m> ${e.message ?? ""}\x1b[0m`);
+      } else if (e.type === "dsl-message") {
+        lines.push(e.message ?? "");
+      } else if (e.type === "damage" && e.payload) {
+        const curTs = e.ts.getTime();
+        if (lastDmgTs !== null && curTs - lastDmgTs >= FIVE_MIN_MS) flushFight();
+        for (const l of buildRoundLines(e.payload)) lines.push(l);
+        fightEvents.push(...payloadToDmgEvents(e.payload));
+        lastDmgTs = curTs;
+        lines.push("");
+      }
+    }
+    flushFight();
+    return lines;
+  };
+
   // copy plain
   const copyPlainText = () => {
     if (!entries.length) return;
-    const ansi = /\x1b\[[0-9;]*[A-Za-z]/g;
-    const chunks: string[] = [];
-    for (const e of entries) {
-      if (e.type === "raw") {
-        chunks.push((e.message ?? "").replace(ansi, ""));
-      } else if (e.type === "client-input") {
-        chunks.push(`> ${e.message ?? ""}`);
-      } else if (e.type === "dsl-message") {
-        chunks.push((e.message ?? "").replace(ansi, "") || " ");
-      } else if (e.type === "damage" && e.payload) {
-        const p = e.payload;
-        chunks.push(`⮞ Damage Round: total=${p.totalDamage}, hits=${p.hits}, misses=${p.misses}`);
-      }
-    }
-    navigator.clipboard.writeText(chunks.join("\n"));
+    safeWrite(collectAnsiLines().map(stripAnsi).join("\n"), "log.txt");
   };
 
   // init xterm
@@ -300,34 +457,34 @@ const LogPlaybackXterm: FC = () => {
 
       const onResize = () => safeFit(fit.current, term.current, container);
       window.addEventListener("resize", onResize);
+      const cleanupScroll = enableMiddleScroll(container, term.current);
 
       return () => {
         window.removeEventListener("resize", onResize);
         io.disconnect(); ro.disconnect();
+        cleanupScroll();
         term.current?.dispose(); term.current = null; fit.current = null;
       };
     }
     return () => { term.current?.dispose(); term.current = null; fit.current = null; };
   }, []);
 
-  // reset on new entries
+  // render full log on load; reset playback state
   useEffect(() => {
     if (!entries.length) return;
     const start = entries[0].ts.getTime();
-    const end = entries[entries.length - 1].ts.getTime();
+    const end   = entries[entries.length - 1].ts.getTime();
     setDuration((end - start) / 1000);
     setTime(0);
     setPlaying(false);
-    lastIndexRef.current = 0;
-    term.current?.clear();
+    setPlaybackActive(false);
+    resetPlaybackRefs();
 
-    lastDamageTsRef.current = null;
-    nextFlushDeadlineRef.current = null;
-    fightFlushedByTimerRef.current = false;
-    byActorRef.current.clear();
-    fightEventsRef.current = [];
-    flushedFinalRef.current = false;
-
+    const t = term.current;
+    if (t) {
+      t.clear();
+      renderAllEntries(t, entries);
+    }
     safeFit(fit.current, term.current, termContainer.current);
   }, [entries]);
 
@@ -406,7 +563,7 @@ const LogPlaybackXterm: FC = () => {
 
   /* Playback render */
   useEffect(() => {
-    if (!entries.length) return;
+    if (!entries.length || !playbackActive) return;
 
     const base = entries[0].ts.getTime();
     const cutoff = base + time * 1000;
@@ -416,13 +573,7 @@ const LogPlaybackXterm: FC = () => {
     // Backward seek
     if (end < lastIndexRef.current) {
       term.current?.clear();
-      lastIndexRef.current = 0;
-      lastDamageTsRef.current = null;
-      nextFlushDeadlineRef.current = null;
-      fightFlushedByTimerRef.current = false;
-      byActorRef.current.clear();
-      fightEventsRef.current = [];
-      flushedFinalRef.current = false;
+      resetPlaybackRefs();
     }
 
     for (let i = lastIndexRef.current; i < end; i++) {
@@ -496,7 +647,7 @@ const LogPlaybackXterm: FC = () => {
     if (end !== entries.length) {
       flushedFinalRef.current = false;
     }
-  }, [time, entries]);
+  }, [time, entries, playbackActive]);
 
   // popup viewer
   const showWholeLog = () => {
@@ -523,62 +674,48 @@ const LogPlaybackXterm: FC = () => {
     ro.observe(container);
     w.addEventListener("beforeunload", () => ro.disconnect());
 
-    // Replay all entries with summaries into popup
-    const popupFightEvents: DmgEvent[] = [];
-    let popupLastDmgTs: number | null = null;
-
-    entries.forEach((e) => {
-      if (e.type === "raw") {
-        t2.write(annotateRawData(e.message ?? ""));
-      } else if (e.type === "client-input") {
-        t2.write(`\x1b[2m> ${e.message}\x1b[0m\r\n`);
-      } else if (e.type === "dsl-message") {
-        const line = e.message ?? "";
-        t2.writeln(line === "" ? " " : line);
-      } else if (e.type === "damage" && e.payload) {
-        const p = e.payload;
-        const curTs = e.ts.getTime();
-
-        if (popupLastDmgTs !== null && curTs - popupLastDmgTs >= FIVE_MIN_MS && popupFightEvents.length > 0) {
-          t2.writeln(`\x1b[1;36m— Fight summary —\x1b[0m`);
-          for (const l of buildFightSummaryLines(popupFightEvents)) t2.writeln(l);
-          t2.writeln("");
-          popupFightEvents.length = 0;
-        }
-
-        for (const l of buildRoundLines(p)) t2.writeln(l);
-        popupFightEvents.push(...payloadToDmgEvents(p));
-        popupLastDmgTs = curTs;
-        t2.writeln("");
-      }
-    });
-
-    // Final fight summary in popup
-    if (popupFightEvents.length > 0) {
-      t2.writeln(`\x1b[1;36m— Fight summary —\x1b[0m`);
-      for (const l of buildFightSummaryLines(popupFightEvents)) t2.writeln(l);
-      t2.writeln("");
-    }
+    renderAllEntries(t2, entries);
   };
 
   // copy as BBCode
   const copyAsBBCode = () => {
     if (!entries.length) return;
-    const parts: string[] = [];
-    for (const e of entries) {
-      if (e.type === "raw") {
-        parts.push(ansiToBBCode(e.message ?? ""));
-      } else if (e.type === "client-input") {
-        parts.push(`> ${e.message ?? ""}`);
-      } else if (e.type === "dsl-message") {
-        parts.push(ansiToBBCode(e.message ?? ""));
-      } else if (e.type === "damage" && e.payload) {
-        const p = e.payload;
-        parts.push(`[B]Damage Round:[/B] total=${p.totalDamage}, hits=${p.hits}, misses=${p.misses}`);
-        parts.push("");
+    safeWrite(collectAnsiLines().map(ansiToBBCode).join("\n"), "log-bbcode.txt");
+  };
+
+  // download helpers
+  const downloadPlainText = () => {
+    if (!entries.length) return;
+    downloadFile(collectAnsiLines().map(stripAnsi).join("\n"), "log.txt");
+  };
+
+  const downloadBBCode = () => {
+    if (!entries.length) return;
+    downloadFile(collectAnsiLines().map(ansiToBBCode).join("\n"), "log-bbcode.txt");
+  };
+
+  const downloadHtml = () => {
+    if (!entries.length) return;
+    downloadFile(buildHtmlPage(collectAnsiLines().map(ansiToHtml)), "log.html", "text/html;charset=utf-8");
+  };
+
+  // copy as HTML
+  const copyAsHtml = async () => {
+    if (!entries.length) return;
+    const htmlLines = collectAnsiLines().map(ansiToHtml);
+    const fragment = `<pre style="background:#111;color:#ccc;font-family:'Courier New',Courier,monospace;font-size:13px;line-height:1.4;padding:8px;white-space:pre-wrap">\n${htmlLines.join("\n")}\n</pre>`;
+    try {
+      if (typeof ClipboardItem !== "undefined") {
+        await navigator.clipboard.write([
+          new ClipboardItem({
+            "text/html":  new Blob([fragment], { type: "text/html" }),
+            "text/plain": new Blob([fragment], { type: "text/plain" }),
+          }),
+        ]);
+        return;
       }
-    }
-    navigator.clipboard.writeText(parts.join("\n"));
+    } catch { /* fall through */ }
+    await safeWrite(buildHtmlPage(htmlLines), "log.html");
   };
 
   return (
@@ -588,21 +725,43 @@ const LogPlaybackXterm: FC = () => {
         {entries.length > 0 && (
           <>
             <button onClick={showWholeLog}>Show Whole Log</button>
-            <button onClick={copyAsBBCode}>Copy BBCode (Forum Color)</button>
-            <button onClick={copyPlainText}>Copy Log (Plain Text)</button>
-            <button onClick={() => setPlaying((p) => !p)}>
-              {playing ? "❚❚ Pause" : "▶️ Start Playback"}
-            </button>
-            <button onClick={() => setTime((t) => Math.max(0, t - tickTimer))}>
-              « {tickTimer}s
-            </button>
-            <button onClick={() => setTime((t) => Math.min(duration, t + tickTimer))}>
-              {tickTimer}s »
-            </button>
-            <span style={{ marginLeft: 12, color: "#aaa" }}>
-              {new Date(time * 1000).toISOString().slice(11, 19)} /{" "}
-              {new Date(duration * 1000).toISOString().slice(11, 19)}
-            </span>
+            <button onClick={copyAsHtml}>Copy HTML</button>
+            <button onClick={downloadHtml}>Download HTML</button>
+            <button onClick={copyAsBBCode}>Copy BBCode</button>
+            <button onClick={downloadBBCode}>Download BBCode</button>
+            <button onClick={copyPlainText}>Copy Plain Text</button>
+            <button onClick={downloadPlainText}>Download Plain Text</button>
+            {!playbackActive ? (
+              <button onClick={() => {
+                term.current?.clear();
+                resetPlaybackRefs();
+                setTime(0);
+                setPlaybackActive(true);
+                setPlaying(true);
+              }}>▶️ Start Playback</button>
+            ) : (
+              <>
+                <button onClick={() => setPlaying((p) => !p)}>
+                  {playing ? "❚❚ Pause" : "▶ Resume"}
+                </button>
+                <button onClick={() => setTime((t) => Math.max(0, t - tickTimer))}>
+                  « {tickTimer}s
+                </button>
+                <button onClick={() => setTime((t) => Math.min(duration, t + tickTimer))}>
+                  {tickTimer}s »
+                </button>
+                <button onClick={() => {
+                  setPlaying(false);
+                  setPlaybackActive(false);
+                  const t = term.current;
+                  if (t) { t.clear(); renderAllEntries(t, entries); }
+                }}>⏮ Exit Playback</button>
+                <span style={{ marginLeft: 12, color: "#aaa" }}>
+                  {new Date(time * 1000).toISOString().slice(11, 19)} /{" "}
+                  {new Date(duration * 1000).toISOString().slice(11, 19)}
+                </span>
+              </>
+            )}
           </>
         )}
       </div>
