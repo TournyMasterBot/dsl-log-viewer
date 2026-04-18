@@ -4,8 +4,9 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import {
-  annotateRawData, buildFightSummaryLines, dmgColor, fmt1,
-  ansiToHtml, buildHtmlPage, stripAnsi,
+  annotateRawData, buildFightSummaryLines, buildRoundSummaryLines,
+  dmgColor, fmt1, ansiToHtml, buildHtmlPage, stripAnsi,
+  parseDmgLine, dmgSource, dmgTarget, dmgAnnotation,
   type DmgEvent,
 } from "../damageParser";
 
@@ -44,7 +45,9 @@ interface LogEntry {
 }
 
 const tickTimer = 42;
-const FIVE_MIN_MS = 5 * 60 * 1000;
+const FIVE_MIN_MS  = 5 * 60 * 1000;
+const ROUND_GAP_MS = 4_000;
+const PROMPT_RE = /\d+%hp|\d+%m |\d+%mv|^<\d+\/\d+hp /;
 
 /* Fit guards */
 function safeFit(addon: FitAddon | null, t: Terminal | null, container: HTMLElement | null) {
@@ -299,6 +302,9 @@ const LogPlaybackXterm: FC = () => {
   const [time, setTime] = useState<number>(0);
   const [playing, setPlaying] = useState<boolean>(false);
   const [playbackActive, setPlaybackActive] = useState<boolean>(false);
+  const [skipAll,    setSkipAll]    = useState(false);
+  const [skipRounds, setSkipRounds] = useState(false);
+  const [skipInline, setSkipInline] = useState(false);
 
   // refs
   const termContainer = useRef<HTMLDivElement>(null);
@@ -317,26 +323,73 @@ const LogPlaybackXterm: FC = () => {
   const byActorRef = useRef<Map<string, PerActor>>(new Map());
   // raw DmgEvent list for fight summary (needed by buildFightSummaryLines)
   const fightEventsRef = useRef<DmgEvent[]>([]);
+  // round-level tracking for new-format raw entries
+  const rawRoundEventsRef  = useRef<DmgEvent[]>([]);
+  const rawHadRoundDmgRef  = useRef<boolean>(false);
 
   const flushedFinalRef = useRef<boolean>(false);
 
   /** Render every entry (with round + fight summaries) into the given terminal. */
-  const renderAllEntries = (t: Terminal, ents: LogEntry[]) => {
+  const renderAllEntries = (t: Terminal, ents: LogEntry[], skipAll = false, skipRounds = false, skipInline = false) => {
     const fightEvents: DmgEvent[] = [];
+    let roundEvents: DmgEvent[] = [];
     let lastDmgTs: number | null = null;
+    let hadRoundDmg = false;
+
+    const flushRound = () => {
+      if (roundEvents.length === 0) return;
+      if (!skipAll && !skipRounds) {
+        for (const l of buildRoundSummaryLines(roundEvents)) t.writeln(l);
+        t.writeln("");
+      }
+      fightEvents.push(...roundEvents);
+      roundEvents = []; hadRoundDmg = false;
+    };
 
     const flushFight = () => {
+      flushRound();
       if (fightEvents.length === 0) return;
-      t.writeln("\x1b[1;36m— Fight summary —\x1b[0m");
-      for (const l of buildFightSummaryLines(fightEvents)) t.writeln(l);
-      t.writeln("");
-      fightEvents.length = 0;
-      lastDmgTs = null;
+      if (!skipAll) {
+        t.writeln("\x1b[1;36m— Fight summary —\x1b[0m");
+        for (const l of buildFightSummaryLines(fightEvents)) t.writeln(l);
+        t.writeln("");
+      }
+      fightEvents.length = 0; lastDmgTs = null;
     };
 
     for (const e of ents) {
       if (e.type === "raw") {
-        t.write(annotateRawData(e.message ?? ""));
+        const curTs = e.ts.getTime();
+        if (lastDmgTs !== null) {
+          const gap = curTs - lastDmgTs;
+          if (gap >= FIVE_MIN_MS) flushFight();
+          else if (gap >= ROUND_GAP_MS && hadRoundDmg) flushRound();
+        }
+        const rawMsg = e.message ?? "";
+        let pos = 0;
+        while (pos < rawMsg.length) {
+          const nl = rawMsg.indexOf('\n', pos);
+          const lineEnd = nl === -1 ? rawMsg.length : nl + 1;
+          const line = rawMsg.slice(pos, lineEnd);
+          const content = line.replace(/[\r\n]+$/, '');
+          const suffix  = line.slice(content.length);
+          const dmg = parseDmgLine(content);
+          if (dmg) {
+            const plain = stripAnsi(content);
+            roundEvents.push({
+              source: dmgSource(plain, dmg.plainIndex),
+              target: dmgTarget(plain.slice(dmg.plainIndex + dmg.key.length)),
+              key: dmg.key, value: dmg.value,
+            });
+            hadRoundDmg = true; lastDmgTs = curTs;
+            t.write(content + (!skipAll && !skipInline ? dmgAnnotation(dmg.value) : '') + suffix);
+          } else {
+            const plain = stripAnsi(content);
+            if (hadRoundDmg && (!plain.trim() || PROMPT_RE.test(plain))) flushRound();
+            t.write(line);
+          }
+          pos = lineEnd; if (nl === -1) break;
+        }
       } else if (e.type === "client-input") {
         t.write(`\x1b[2m> ${e.message}\x1b[0m\r\n`);
       } else if (e.type === "dsl-message") {
@@ -345,7 +398,9 @@ const LogPlaybackXterm: FC = () => {
       } else if (e.type === "damage" && e.payload) {
         const curTs = e.ts.getTime();
         if (lastDmgTs !== null && curTs - lastDmgTs >= FIVE_MIN_MS) flushFight();
-        for (const l of buildRoundLines(e.payload)) t.writeln(l);
+        if (!skipAll && !skipRounds) {
+          for (const l of buildRoundLines(e.payload)) t.writeln(l);
+        }
         fightEvents.push(...payloadToDmgEvents(e.payload));
         lastDmgTs = curTs;
         t.writeln("");
@@ -362,6 +417,8 @@ const LogPlaybackXterm: FC = () => {
     fightFlushedByTimerRef.current = false;
     byActorRef.current.clear();
     fightEventsRef.current = [];
+    rawRoundEventsRef.current = [];
+    rawHadRoundDmgRef.current = false;
     flushedFinalRef.current = false;
   };
 
@@ -397,23 +454,59 @@ const LogPlaybackXterm: FC = () => {
    * ANSI-tagged lines — including round summaries and fight summaries.
    * Callers convert to plain / BBCode / HTML as needed.
    */
-  const collectAnsiLines = (): string[] => {
+  const collectAnsiLines = (skipAll = false, skipRounds = false, skipInline = false): string[] => {
     const lines: string[] = [];
     const fightEvents: DmgEvent[] = [];
+    let roundEvents: DmgEvent[] = [];
     let lastDmgTs: number | null = null;
+    let hadRoundDmg = false;
+
+    const flushRound = () => {
+      if (roundEvents.length === 0) return;
+      if (!skipAll && !skipRounds) {
+        for (const l of buildRoundSummaryLines(roundEvents)) lines.push(l);
+        lines.push("");
+      }
+      fightEvents.push(...roundEvents);
+      roundEvents = []; hadRoundDmg = false;
+    };
 
     const flushFight = () => {
+      flushRound();
       if (fightEvents.length === 0) return;
-      lines.push("\x1b[1;36m— Fight summary —\x1b[0m");
-      for (const l of buildFightSummaryLines(fightEvents)) lines.push(l);
-      lines.push("");
-      fightEvents.length = 0;
-      lastDmgTs = null;
+      if (!skipAll) {
+        lines.push("\x1b[1;36m— Fight summary —\x1b[0m");
+        for (const l of buildFightSummaryLines(fightEvents)) lines.push(l);
+        lines.push("");
+      }
+      fightEvents.length = 0; lastDmgTs = null;
     };
 
     for (const e of entries) {
       if (e.type === "raw") {
-        for (const l of (e.message ?? "").split(/\r?\n/)) lines.push(l);
+        const curTs = e.ts.getTime();
+        if (lastDmgTs !== null) {
+          const gap = curTs - lastDmgTs;
+          if (gap >= FIVE_MIN_MS) flushFight();
+          else if (gap >= ROUND_GAP_MS && hadRoundDmg) flushRound();
+        }
+        for (const rawLine of (e.message ?? "").split(/\r?\n/)) {
+          const dmg = parseDmgLine(rawLine);
+          if (dmg) {
+            const plain = stripAnsi(rawLine);
+            roundEvents.push({
+              source: dmgSource(plain, dmg.plainIndex),
+              target: dmgTarget(plain.slice(dmg.plainIndex + dmg.key.length)),
+              key: dmg.key, value: dmg.value,
+            });
+            hadRoundDmg = true; lastDmgTs = curTs;
+            lines.push(rawLine + (!skipAll && !skipInline ? dmgAnnotation(dmg.value) : ''));
+          } else {
+            const plain = stripAnsi(rawLine);
+            if (hadRoundDmg && (!plain.trim() || PROMPT_RE.test(plain))) flushRound();
+            lines.push(rawLine);
+          }
+        }
       } else if (e.type === "client-input") {
         lines.push(`\x1b[2m> ${e.message ?? ""}\x1b[0m`);
       } else if (e.type === "dsl-message") {
@@ -421,7 +514,9 @@ const LogPlaybackXterm: FC = () => {
       } else if (e.type === "damage" && e.payload) {
         const curTs = e.ts.getTime();
         if (lastDmgTs !== null && curTs - lastDmgTs >= FIVE_MIN_MS) flushFight();
-        for (const l of buildRoundLines(e.payload)) lines.push(l);
+        if (!skipAll && !skipRounds) {
+          for (const l of buildRoundLines(e.payload)) lines.push(l);
+        }
         fightEvents.push(...payloadToDmgEvents(e.payload));
         lastDmgTs = curTs;
         lines.push("");
@@ -434,7 +529,7 @@ const LogPlaybackXterm: FC = () => {
   // copy plain
   const copyPlainText = () => {
     if (!entries.length) return;
-    safeWrite(collectAnsiLines().map(stripAnsi).join("\n"), "log.txt");
+    safeWrite(collectAnsiLines(skipAll, skipRounds, skipInline).map(stripAnsi).join("\n"), "log.txt");
   };
 
   // init xterm
@@ -483,10 +578,20 @@ const LogPlaybackXterm: FC = () => {
     const t = term.current;
     if (t) {
       t.clear();
-      renderAllEntries(t, entries);
+      renderAllEntries(t, entries, skipAll, skipRounds, skipInline);
     }
     safeFit(fit.current, term.current, termContainer.current);
-  }, [entries]);
+  }, [entries]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Re-render when opts change (only outside playback)
+  useEffect(() => {
+    if (!entries.length || playbackActive) return;
+    const t = term.current;
+    if (t) {
+      t.clear();
+      renderAllEntries(t, entries, skipAll, skipRounds, skipInline);
+    }
+  }, [skipAll, skipRounds, skipInline]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // playback clock
   useEffect(() => {
@@ -539,23 +644,37 @@ const LogPlaybackXterm: FC = () => {
     fightEventsRef.current.push(...payloadToDmgEvents(p));
   };
 
-  const flushFightSummary = (label = "— Fight summary —") => {
+  const flushRawRound = (skipRounds = false) => {
+    const events = rawRoundEventsRef.current;
+    if (events.length === 0) return;
+    const t = term.current;
+    if (!skipRounds && t) {
+      for (const l of buildRoundSummaryLines(events)) t.writeln(l);
+      t.writeln("");
+    }
+    fightEventsRef.current.push(...events);
+    rawRoundEventsRef.current = [];
+    rawHadRoundDmgRef.current = false;
+  };
+
+  const flushFightSummary = (label = "— Fight summary —", skipAll = false, skipRounds = false) => {
+    flushRawRound(skipRounds);
     const events = fightEventsRef.current;
     if (events.length === 0 && byActorRef.current.size === 0) return;
 
-    const t = term.current;
-    if (!t) return;
+    if (!skipAll) {
+      const t = term.current;
+      if (t) {
+        t.writeln(`\x1b[1;36m${label}\x1b[0m`);
+        for (const l of buildFightSummaryLines(events)) t.writeln(l);
+        t.writeln("");
+      }
+    }
 
-    t.writeln(`\x1b[1;36m${label}\x1b[0m`);
-
-    // Use the shared fight summary builder
-    const summaryLines = buildFightSummaryLines(events);
-    for (const l of summaryLines) t.writeln(l);
-    t.writeln("");
-
-    // reset fight
     byActorRef.current.clear();
     fightEventsRef.current = [];
+    rawRoundEventsRef.current = [];
+    rawHadRoundDmgRef.current = false;
     lastDamageTsRef.current = null;
     nextFlushDeadlineRef.current = null;
     fightFlushedByTimerRef.current = true;
@@ -579,9 +698,45 @@ const LogPlaybackXterm: FC = () => {
     for (let i = lastIndexRef.current; i < end; i++) {
       const entry = entries[i];
 
-      // New format: annotate damage lines in raw server output
+      // New format: annotate damage + track round/fight summaries
       if (entry.type === "raw") {
-        term.current?.write(annotateRawData(entry.message ?? ""));
+        const curTs = entry.ts.getTime();
+        if (lastDamageTsRef.current !== null) {
+          const gap = curTs - lastDamageTsRef.current;
+          if (gap >= FIVE_MIN_MS && (fightEventsRef.current.length > 0 || rawRoundEventsRef.current.length > 0)) {
+            flushFightSummary("— Fight summary —", skipAll, skipRounds);
+          } else if (gap >= ROUND_GAP_MS && rawHadRoundDmgRef.current) {
+            flushRawRound(skipRounds);
+          }
+        }
+        const rawMsg = entry.message ?? "";
+        let pos = 0;
+        while (pos < rawMsg.length) {
+          const nl = rawMsg.indexOf('\n', pos);
+          const lineEnd = nl === -1 ? rawMsg.length : nl + 1;
+          const line = rawMsg.slice(pos, lineEnd);
+          const content = line.replace(/[\r\n]+$/, '');
+          const suffix  = line.slice(content.length);
+          const dmg = parseDmgLine(content);
+          if (dmg) {
+            const plain = stripAnsi(content);
+            rawRoundEventsRef.current.push({
+              source: dmgSource(plain, dmg.plainIndex),
+              target: dmgTarget(plain.slice(dmg.plainIndex + dmg.key.length)),
+              key: dmg.key, value: dmg.value,
+            });
+            rawHadRoundDmgRef.current = true;
+            lastDamageTsRef.current = curTs;
+            nextFlushDeadlineRef.current = curTs + FIVE_MIN_MS;
+            fightFlushedByTimerRef.current = false;
+            term.current?.write(content + (!skipAll && !skipInline ? dmgAnnotation(dmg.value) : '') + suffix);
+          } else {
+            const plain = stripAnsi(content);
+            if (rawHadRoundDmgRef.current && (!plain.trim() || PROMPT_RE.test(plain))) flushRawRound(skipRounds);
+            term.current?.write(line);
+          }
+          pos = lineEnd; if (nl === -1) break;
+        }
         continue;
       }
 
@@ -607,12 +762,14 @@ const LogPlaybackXterm: FC = () => {
           curTs - lastDamageTsRef.current >= FIVE_MIN_MS &&
           (byActorRef.current.size > 0 || fightEventsRef.current.length > 0)
         ) {
-          flushFightSummary("— Fight summary —");
+          flushFightSummary("— Fight summary —", skipAll, skipRounds);
         }
 
         // Emit round summary
-        const roundLines = buildRoundLines(p);
-        for (const l of roundLines) term.current?.writeln(l);
+        if (!skipAll && !skipRounds) {
+          const roundLines = buildRoundLines(p);
+          for (const l of roundLines) term.current?.writeln(l);
+        }
 
         // Accumulate for fight
         addRoundToActors(p);
@@ -628,26 +785,27 @@ const LogPlaybackXterm: FC = () => {
     lastIndexRef.current = end;
 
     // Time-based gap flush
+    const hasPendingFight = byActorRef.current.size > 0 || fightEventsRef.current.length > 0 || rawRoundEventsRef.current.length > 0;
     if (
       nextFlushDeadlineRef.current !== null &&
       cutoff >= nextFlushDeadlineRef.current &&
       !fightFlushedByTimerRef.current &&
-      (byActorRef.current.size > 0 || fightEventsRef.current.length > 0)
+      hasPendingFight
     ) {
-      flushFightSummary("— Fight summary —");
+      flushFightSummary("— Fight summary —", skipAll, skipRounds);
     }
 
     // End-of-log flush
     if (end === entries.length && !flushedFinalRef.current) {
-      if (byActorRef.current.size > 0 || fightEventsRef.current.length > 0) {
-        flushFightSummary("— Fight summary —");
+      if (byActorRef.current.size > 0 || fightEventsRef.current.length > 0 || rawRoundEventsRef.current.length > 0) {
+        flushFightSummary("— Fight summary —", skipAll, skipRounds);
       }
       flushedFinalRef.current = true;
     }
     if (end !== entries.length) {
       flushedFinalRef.current = false;
     }
-  }, [time, entries, playbackActive]);
+  }, [time, entries, playbackActive, skipAll, skipRounds, skipInline]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // popup viewer
   const showWholeLog = () => {
@@ -674,35 +832,35 @@ const LogPlaybackXterm: FC = () => {
     ro.observe(container);
     w.addEventListener("beforeunload", () => ro.disconnect());
 
-    renderAllEntries(t2, entries);
+    renderAllEntries(t2, entries, skipAll, skipRounds, skipInline);
   };
 
   // copy as BBCode
   const copyAsBBCode = () => {
     if (!entries.length) return;
-    safeWrite(collectAnsiLines().map(ansiToBBCode).join("\n"), "log-bbcode.txt");
+    safeWrite(collectAnsiLines(skipAll, skipRounds, skipInline).map(ansiToBBCode).join("\n"), "log-bbcode.txt");
   };
 
   // download helpers
   const downloadPlainText = () => {
     if (!entries.length) return;
-    downloadFile(collectAnsiLines().map(stripAnsi).join("\n"), "log.txt");
+    downloadFile(collectAnsiLines(skipAll, skipRounds, skipInline).map(stripAnsi).join("\n"), "log.txt");
   };
 
   const downloadBBCode = () => {
     if (!entries.length) return;
-    downloadFile(collectAnsiLines().map(ansiToBBCode).join("\n"), "log-bbcode.txt");
+    downloadFile(collectAnsiLines(skipAll, skipRounds, skipInline).map(ansiToBBCode).join("\n"), "log-bbcode.txt");
   };
 
   const downloadHtml = () => {
     if (!entries.length) return;
-    downloadFile(buildHtmlPage(collectAnsiLines().map(ansiToHtml)), "log.html", "text/html;charset=utf-8");
+    downloadFile(buildHtmlPage(collectAnsiLines(skipAll, skipRounds, skipInline).map(ansiToHtml)), "log.html", "text/html;charset=utf-8");
   };
 
   // copy as HTML
   const copyAsHtml = async () => {
     if (!entries.length) return;
-    const htmlLines = collectAnsiLines().map(ansiToHtml);
+    const htmlLines = collectAnsiLines(skipAll, skipRounds, skipInline).map(ansiToHtml);
     const fragment = `<pre style="background:#111;color:#ccc;font-family:'Courier New',Courier,monospace;font-size:13px;line-height:1.4;padding:8px;white-space:pre-wrap">\n${htmlLines.join("\n")}\n</pre>`;
     try {
       if (typeof ClipboardItem !== "undefined") {
@@ -724,6 +882,17 @@ const LogPlaybackXterm: FC = () => {
         <input type="file" accept=".log,.txt,.jsonl" onChange={onFile} />
         {entries.length > 0 && (
           <>
+            {(
+              [
+                ["skipAll",    skipAll,    setSkipAll,    "Skip damage summaries"] as const,
+                ["skipRounds", skipRounds, setSkipRounds, "Skip round summaries"]  as const,
+                ["skipInline", skipInline, setSkipInline, "Skip inline summaries"] as const,
+              ] as const
+            ).map(([id, val, setter, label]) => (
+              <label key={id} style={{ marginLeft: 8 }}>
+                <input type="checkbox" checked={val} onChange={e => setter(e.target.checked)} />{" "}{label}
+              </label>
+            ))}
             <button onClick={showWholeLog}>Show Whole Log</button>
             <button onClick={copyAsHtml}>Copy HTML</button>
             <button onClick={downloadHtml}>Download HTML</button>
@@ -754,7 +923,7 @@ const LogPlaybackXterm: FC = () => {
                   setPlaying(false);
                   setPlaybackActive(false);
                   const t = term.current;
-                  if (t) { t.clear(); renderAllEntries(t, entries); }
+                  if (t) { t.clear(); renderAllEntries(t, entries, skipAll, skipRounds, skipInline); }
                 }}>⏮ Exit Playback</button>
                 <span style={{ marginLeft: 12, color: "#aaa" }}>
                   {new Date(time * 1000).toISOString().slice(11, 19)} /{" "}

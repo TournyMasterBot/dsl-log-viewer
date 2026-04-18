@@ -61,6 +61,11 @@ export function parseDmgLine(line: string): ParsedDmg | null {
   const plain = stripAnsi(line);
   // Skip death/kill announcement lines where damage verbs appear in non-combat context
   if (/\bDEAD[.!]/.test(plain) || /\bhits the ground\b/.test(plain)) return null;
+  // Skip opponent health/gate descriptions matching OPPONENT_GATES patterns with damage keywords:
+  // "few scratches", "small wounds and bruises", "quite a few wounds", "big nasty wounds and scratches"
+  if (/\bhas\s+(?:a?\s*few\s+scratches|(?:quite\s+a\s+few|big\s+nasty|small)\s+wounds)/i.test(plain)) return null;
+  // Skip spell/affect display lines ("modifies hit roll by N for N cycles")
+  if (/\bmodifies\s+\w+\s+roll\b/i.test(plain)) return null;
   for (const key of DAMAGE_KEYS_SORTED) {
     const idx = plain.indexOf(key);
     if (idx === -1) continue;
