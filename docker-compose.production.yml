@@ -1,0 +1,28 @@
+name: dsl-log-viewer
+
+networks:
+  shatteredarchive-prod_shatteredarchive-prod:
+    external: true
+
+services:
+  dsl-log-viewer:
+    container_name: dsl-log-viewer
+    build:
+      context: .
+      dockerfile: Dockerfile
+      pull: true
+    expose:
+      - "5900"
+    restart: unless-stopped
+    networks:
+      - shatteredarchive-prod_shatteredarchive-prod
+
+
+# copy docker-compose.yml and Dockerfile and nginx.conf to server
+# --
+# on server,
+# docker compose up --build
+# d (to detach)
+# --
+# Check logs
+# docker logs -f --tail 200 dsl-log-viewer
