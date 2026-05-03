@@ -4,7 +4,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import {
-  annotateRawData, buildFightSummaryLines, buildRoundSummaryLines,
+  buildFightSummaryLines, buildRoundSummaryLines,
   dmgColor, fmt1, ansiToHtml, buildHtmlPage, stripAnsi,
   parseDmgLine, dmgSource, dmgTarget, dmgAnnotation,
   type DmgEvent,
@@ -46,8 +46,7 @@ interface LogEntry {
 
 const tickTimer = 42;
 const FIVE_MIN_MS  = 5 * 60 * 1000;
-const ROUND_GAP_MS = 4_000;
-const PROMPT_RE = /\d+%hp|\d+%m |\d+%mv|^<\d+\/\d+hp /;
+const ROUND_GAP_MS = 1_000;
 
 /* Fit guards */
 function safeFit(addon: FitAddon | null, t: Terminal | null, container: HTMLElement | null) {
@@ -305,6 +304,9 @@ const LogPlaybackXterm: FC = () => {
   const [skipAll,    setSkipAll]    = useState(false);
   const [skipRounds, setSkipRounds] = useState(false);
   const [skipInline, setSkipInline] = useState(false);
+  const [urlInput,   setUrlInput]   = useState("");
+  const [urlLoading, setUrlLoading] = useState(false);
+  const [urlError,   setUrlError]   = useState("");
 
   // refs
   const termContainer = useRef<HTMLDivElement>(null);
@@ -339,6 +341,7 @@ const LogPlaybackXterm: FC = () => {
     const flushRound = () => {
       if (roundEvents.length === 0) return;
       if (!skipAll && !skipRounds) {
+        t.writeln("");
         for (const l of buildRoundSummaryLines(roundEvents)) t.writeln(l);
         t.writeln("");
       }
@@ -357,14 +360,10 @@ const LogPlaybackXterm: FC = () => {
       fightEvents.length = 0; lastDmgTs = null;
     };
 
-    for (const e of ents) {
+    for (let idx = 0; idx < ents.length; idx++) {
+      const e = ents[idx];
       if (e.type === "raw") {
         const curTs = e.ts.getTime();
-        if (lastDmgTs !== null) {
-          const gap = curTs - lastDmgTs;
-          if (gap >= FIVE_MIN_MS) flushFight();
-          else if (gap >= ROUND_GAP_MS && hadRoundDmg) flushRound();
-        }
         const rawMsg = e.message ?? "";
         let pos = 0;
         while (pos < rawMsg.length) {
@@ -384,11 +383,19 @@ const LogPlaybackXterm: FC = () => {
             hadRoundDmg = true; lastDmgTs = curTs;
             t.write(content + (!skipAll && !skipInline ? dmgAnnotation(dmg.value) : '') + suffix);
           } else {
-            const plain = stripAnsi(content);
-            if (hadRoundDmg && (!plain.trim() || PROMPT_RE.test(plain))) flushRound();
             t.write(line);
           }
           pos = lineEnd; if (nl === -1) break;
+        }
+        // Lookahead: flush after writing this entry based on gap to next raw entry
+        if (lastDmgTs !== null) {
+          let nextRawTs = -1;
+          for (let j = idx + 1; j < ents.length; j++) {
+            if (ents[j].type === "raw") { nextRawTs = ents[j].ts.getTime(); break; }
+          }
+          const gap = nextRawTs >= 0 ? nextRawTs - lastDmgTs : FIVE_MIN_MS + 1;
+          if (gap >= FIVE_MIN_MS) flushFight();
+          else if (gap >= ROUND_GAP_MS && hadRoundDmg) flushRound();
         }
       } else if (e.type === "client-input") {
         t.write(`\x1b[2m> ${e.message}\x1b[0m\r\n`);
@@ -431,6 +438,28 @@ const LogPlaybackXterm: FC = () => {
     reader.readAsText(file);
   };
 
+  const loadFromUrl = async () => {
+    const url = urlInput.trim();
+    if (!url) return;
+    setUrlLoading(true);
+    setUrlError("");
+    try {
+      const dockerUrl = url.replace(/^https?:\/\/shatteredarchive\.com/, "http://shatteredarchive-csharp:5000");
+      let res = await fetch(dockerUrl).catch(() => null);
+      if (!res || !res.ok) {
+        res = await fetch(url);
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      // Content-Encoding: gzip is decompressed transparently by the browser fetch API
+      const text = await res.text();
+      setEntries(parseLog(text));
+    } catch (e) {
+      setUrlError(e instanceof Error ? e.message : "Failed to load");
+    } finally {
+      setUrlLoading(false);
+    }
+  };
+
   /** Writes text to clipboard; falls back to file download if the API fails. */
   const safeWrite = async (content: string, filename: string) => {
     try {
@@ -464,6 +493,7 @@ const LogPlaybackXterm: FC = () => {
     const flushRound = () => {
       if (roundEvents.length === 0) return;
       if (!skipAll && !skipRounds) {
+        lines.push("");
         for (const l of buildRoundSummaryLines(roundEvents)) lines.push(l);
         lines.push("");
       }
@@ -482,14 +512,10 @@ const LogPlaybackXterm: FC = () => {
       fightEvents.length = 0; lastDmgTs = null;
     };
 
-    for (const e of entries) {
+    for (let idx = 0; idx < entries.length; idx++) {
+      const e = entries[idx];
       if (e.type === "raw") {
         const curTs = e.ts.getTime();
-        if (lastDmgTs !== null) {
-          const gap = curTs - lastDmgTs;
-          if (gap >= FIVE_MIN_MS) flushFight();
-          else if (gap >= ROUND_GAP_MS && hadRoundDmg) flushRound();
-        }
         for (const rawLine of (e.message ?? "").split(/\r?\n/)) {
           const dmg = parseDmgLine(rawLine);
           if (dmg) {
@@ -502,10 +528,18 @@ const LogPlaybackXterm: FC = () => {
             hadRoundDmg = true; lastDmgTs = curTs;
             lines.push(rawLine + (!skipAll && !skipInline ? dmgAnnotation(dmg.value) : ''));
           } else {
-            const plain = stripAnsi(rawLine);
-            if (hadRoundDmg && (!plain.trim() || PROMPT_RE.test(plain))) flushRound();
             lines.push(rawLine);
           }
+        }
+        // Lookahead: flush after writing this entry based on gap to next raw entry
+        if (lastDmgTs !== null) {
+          let nextRawTs = -1;
+          for (let j = idx + 1; j < entries.length; j++) {
+            if (entries[j].type === "raw") { nextRawTs = entries[j].ts.getTime(); break; }
+          }
+          const gap = nextRawTs >= 0 ? nextRawTs - lastDmgTs : FIVE_MIN_MS + 1;
+          if (gap >= FIVE_MIN_MS) flushFight();
+          else if (gap >= ROUND_GAP_MS && hadRoundDmg) flushRound();
         }
       } else if (e.type === "client-input") {
         lines.push(`\x1b[2m> ${e.message ?? ""}\x1b[0m`);
@@ -649,6 +683,7 @@ const LogPlaybackXterm: FC = () => {
     if (events.length === 0) return;
     const t = term.current;
     if (!skipRounds && t) {
+      t.writeln("");
       for (const l of buildRoundSummaryLines(events)) t.writeln(l);
       t.writeln("");
     }
@@ -731,8 +766,6 @@ const LogPlaybackXterm: FC = () => {
             fightFlushedByTimerRef.current = false;
             term.current?.write(content + (!skipAll && !skipInline ? dmgAnnotation(dmg.value) : '') + suffix);
           } else {
-            const plain = stripAnsi(content);
-            if (rawHadRoundDmgRef.current && (!plain.trim() || PROMPT_RE.test(plain))) flushRawRound(skipRounds);
             term.current?.write(line);
           }
           pos = lineEnd; if (nl === -1) break;
@@ -783,6 +816,16 @@ const LogPlaybackXterm: FC = () => {
     }
 
     lastIndexRef.current = end;
+
+    // Time-based round flush (fires during the gap between rounds)
+    if (
+      lastDamageTsRef.current !== null &&
+      rawHadRoundDmgRef.current &&
+      rawRoundEventsRef.current.length > 0 &&
+      cutoff - lastDamageTsRef.current >= ROUND_GAP_MS
+    ) {
+      flushRawRound(skipRounds);
+    }
 
     // Time-based gap flush
     const hasPendingFight = byActorRef.current.size > 0 || fightEventsRef.current.length > 0 || rawRoundEventsRef.current.length > 0;
@@ -880,6 +923,18 @@ const LogPlaybackXterm: FC = () => {
     <div style={{ height: "100%", display: "flex", flexDirection: "column" }}>
       <div style={{ padding: 8, background: "#222", color: "#fff", flexShrink: 0 }}>
         <input type="file" accept=".log,.txt,.jsonl" onChange={onFile} />
+        <input
+          type="text"
+          placeholder="or paste URL…"
+          value={urlInput}
+          onChange={e => setUrlInput(e.target.value)}
+          onKeyDown={e => e.key === "Enter" && loadFromUrl()}
+          style={{ marginLeft: 8, width: 360, background: "#333", color: "#fff", border: "1px solid #555", padding: "2px 6px" }}
+        />
+        <button onClick={loadFromUrl} disabled={urlLoading} style={{ marginLeft: 4 }}>
+          {urlLoading ? "Loading…" : "Load URL"}
+        </button>
+        {urlError && <span style={{ marginLeft: 8, color: "#f88" }}>{urlError}</span>}
         {entries.length > 0 && (
           <>
             {(

@@ -6,6 +6,6 @@ export default defineConfig({
   server: {
     host: "0.0.0.0",
     port: 5900,
-    allowedHosts: ["dsl-log-viewer.shatteredarchive.com"],
+    allowedHosts: ["dsl-log-viewer.shatteredarchive.com", "localhost"],
   },
 });

@@ -1,5 +1,9 @@
 name: dsl-log-viewer
 
+networks:
+  sa-shared:
+    external: true
+
 services:
   dsl-log-viewer:
     container_name: dsl-log-viewer
@@ -7,9 +11,11 @@ services:
       context: .
       dockerfile: Dockerfile
       pull: true
-    ports:
-      - "5900:5900"
+    expose:
+      - "5900"
     restart: unless-stopped
+    networks:
+      - sa-shared
 
 
 # copy docker-compose.yml and Dockerfile and nginx.conf to server
