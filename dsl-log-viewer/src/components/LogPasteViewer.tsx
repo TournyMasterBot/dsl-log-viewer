@@ -12,7 +12,7 @@ import {
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-type Format = "rawlog" | "mudlet" | "plain" | "ansi";
+type Format = "rawlog" | "mudlet" | "plaintime" | "plain" | "ansi";
 
 interface Entry {
   ts?: number;   // ms offset from first entry; undefined when no timestamps
@@ -33,6 +33,8 @@ function detectFormat(text: string): Format {
   if (rawlogHits >= Math.max(1, sample.length * 0.4)) return "rawlog";
   const mudletHits = sample.filter(l => /^\d{2}:\d{2}:\d{2}\.\d{3} /.test(l)).length;
   if (mudletHits >= Math.max(1, sample.length * 0.3)) return "mudlet";
+  const plaintimeHits = sample.filter(l => /^\d{2}:\d{2}:\d{2}[ap] \| /.test(l)).length;
+  if (plaintimeHits >= Math.max(1, sample.length * 0.3)) return "plaintime";
   // Detect ANSI color sequences — with ESC byte (\x1b[) OR ESC-stripped (literal [1;31m)
   const ansiHits = sample.filter(l => /\x1b\[/.test(l) || /\[[0-9;]+m/.test(l)).length;
   if (ansiHits >= Math.max(1, sample.length * 0.1)) return "ansi";
@@ -84,6 +86,36 @@ function parseMudlet(text: string): Entry[] {
   return entries;
 }
 
+// Plain text with timestamps: "HH:MM:SSa|p | content"
+// 'a' = AM, 'p' = PM (12-hour clock). Content may have bare ANSI bracket sequences.
+function parsePlaintime(text: string): Entry[] {
+  const entries: Entry[] = [];
+  let baseMs: number | null = null;
+  let lastTs = 0;
+  for (const line of text.split(/\r?\n/)) {
+    const m = line.match(/^(\d{2}):(\d{2}):(\d{2})([ap]) \| (.*)/);
+    if (!m) {
+      if (entries.length > 0) entries.push({ ts: lastTs, text: "" });
+      continue;
+    }
+    let h = parseInt(m[1]);
+    const min = parseInt(m[2]);
+    const sec = parseInt(m[3]);
+    const isPm = m[4] === "p";
+    // 12-hour → 24-hour conversion
+    if (isPm && h !== 12) h += 12;
+    else if (!isPm && h === 12) h = 0;
+    const totalMs = h * 3_600_000 + min * 60_000 + sec * 1_000;
+    if (baseMs === null) baseMs = totalMs;
+    let offset = totalMs - baseMs;
+    if (offset < 0) offset += 86_400_000; // midnight rollover
+    lastTs = offset;
+    const content = m[5].replace(/(?<!\x1b)\[([0-9;]*)m/g, "\x1b[$1m");
+    entries.push({ ts: offset, text: content });
+  }
+  return entries;
+}
+
 // Plain text: no timestamps, each line is one entry
 function parsePlain(text: string): Entry[] {
   return text.split(/\r?\n/).map(line => ({ text: line }));
@@ -101,9 +133,10 @@ function parseAnsi(text: string): Entry[] {
 function parseLog(text: string): Parsed {
   const format = detectFormat(text);
   const entries =
-    format === "rawlog" ? parseRawlog(text) :
-    format === "mudlet" ? parseMudlet(text) :
-    format === "ansi"   ? parseAnsi(text) :
+    format === "rawlog"     ? parseRawlog(text) :
+    format === "mudlet"     ? parseMudlet(text) :
+    format === "plaintime"  ? parsePlaintime(text) :
+    format === "ansi"       ? parseAnsi(text) :
     parsePlain(text);
   return { format, entries, hasTimestamps: entries.some(e => e.ts !== undefined) };
 }
@@ -363,10 +396,11 @@ function renderEntryTracked(
 const TICK_MS = 100;
 const TICK_S  = 42;
 const FORMAT_LABELS: Record<Format, string> = {
-  rawlog: "DSL Raw Log (¤TS=…¤)",
-  mudlet: "Mudlet timestamped",
-  plain:  "Plain text",
-  ansi:   "Plain text (ANSI colors)",
+  rawlog:    "DSL Raw Log (¤TS=…¤)",
+  mudlet:    "Mudlet timestamped",
+  plaintime: "Plain text (HH:MM:SSa|p)",
+  plain:     "Plain text",
+  ansi:      "Plain text (ANSI colors)",
 };
 
 const LogPasteViewer: FC = () => {

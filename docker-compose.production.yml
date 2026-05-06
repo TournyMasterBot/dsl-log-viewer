@@ -1,3 +1,4 @@
+# docker compose -f docker-compose-prod.yml up --build -d
 name: dsl-log-viewer
 
 networks:
