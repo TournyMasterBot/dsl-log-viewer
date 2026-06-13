@@ -687,20 +687,6 @@ const LogPasteViewer: FC = () => {
     setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 100);
   };
 
-  /** Writes text to clipboard; falls back to a file download if the API fails or the payload is too large. */
-  const safeWrite = async (content: string, filename: string) => {
-    try {
-      await navigator.clipboard.writeText(content);
-    } catch {
-      const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url; a.download = filename;
-      document.body.appendChild(a); a.click();
-      setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 100);
-    }
-  };
-
   const useRaw = (fmt: Format) => fmt === "rawlog" || fmt === "ansi";
 
   const prepareText = (e: Entry): string => {
