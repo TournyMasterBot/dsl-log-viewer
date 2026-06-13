@@ -361,7 +361,10 @@ export function ansiToHtml(line: string): string {
     const fg30      = codes.find(c => c >= 30 && c <= 37);
 
     let color: string | null = null;
-    if (bright90 !== undefined) {
+    if (codes[0] === 38 && codes[1] === 2 && codes.length >= 5) {
+      const toHex = (n: number) => Math.max(0, Math.min(255, n)).toString(16).padStart(2, "0");
+      color = `#${toHex(codes[2])}${toHex(codes[3])}${toHex(codes[4])}`;
+    } else if (bright90 !== undefined) {
       color = ANSI_FG_CSS[bright90 - 60]?.[1] ?? null;
     } else if (fg30 !== undefined) {
       color = (dim && fg30 === 37) ? "#777777" : (ANSI_FG_CSS[fg30]?.[bold ? 1 : 0] ?? null);

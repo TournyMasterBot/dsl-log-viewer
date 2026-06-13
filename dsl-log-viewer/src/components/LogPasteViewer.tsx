@@ -174,6 +174,39 @@ function colorize(line: string): string {
   return line;
 }
 
+// ─── DSL color codes ─────────────────────────────────────────────────────────
+
+const DSL_COLOR_HEX: Record<string, string> = {
+  "{r": "#800000", "{R": "#FF0000",
+  "{y": "#808000", "{Y": "#FFFF00",
+  "{b": "#00BFFF", "{B": "#0000FF",
+  "{c": "#008080", "{C": "#00FFFF",
+  "{m": "#8B008B", "{M": "#FF00FF",
+  "{g": "#008000", "{G": "#00FF00",
+  "{D": "#808080", "{W": "#FFFFFF",
+  "{o": "#FF8040", "{p": "#FF80C0",
+  "{n": "#804040", "{u": "#8E7CC3",
+  "{w": "#C0C0C0",
+};
+
+const DSL_CODE_RE = /\{[rRyYbBcCmMgGDWopnuwx]/g;
+
+function applyDslColors(line: string): string {
+  return line.replace(DSL_CODE_RE, code => {
+    if (code === "{x") return "\x1b[0m";
+    const hex = DSL_COLOR_HEX[code];
+    if (!hex) return code;
+    const r = parseInt(hex.slice(1, 3), 16);
+    const g = parseInt(hex.slice(3, 5), 16);
+    const b = parseInt(hex.slice(5, 7), 16);
+    return `\x1b[38;2;${r};${g};${b}m`;
+  });
+}
+
+function stripDslCodes(line: string): string {
+  return line.replace(DSL_CODE_RE, "");
+}
+
 // ─── ANSI → BBCode ───────────────────────────────────────────────────────────
 
 const ANSI_COLOR_NAMES: Record<number, string> = {
@@ -196,12 +229,19 @@ function ansiToBBCode(line: string): string {
     out += line.slice(last, m.index);
     const codes = m[1].split(";").map(Number);
     if (codes.includes(0) && open) { out += "[/COLOR]"; open = null; }
-    const col = pick(codes);
-    if (col !== undefined) {
-      const name = ANSI_COLOR_NAMES[col];
-      if (name && line.charAt(esc.lastIndex) !== "]") {
-        if (open) out += "[/COLOR]";
-        out += `[COLOR=${name}]`; open = name;
+    if (codes[0] === 38 && codes[1] === 2 && codes.length >= 5) {
+      const toHex = (n: number) => n.toString(16).padStart(2, "0");
+      const hex = `#${toHex(codes[2])}${toHex(codes[3])}${toHex(codes[4])}`;
+      if (open) out += "[/COLOR]";
+      out += `[COLOR=${hex}]`; open = hex;
+    } else {
+      const col = pick(codes);
+      if (col !== undefined) {
+        const name = ANSI_COLOR_NAMES[col];
+        if (name && line.charAt(esc.lastIndex) !== "]") {
+          if (open) out += "[/COLOR]";
+          out += `[COLOR=${name}]`; open = name;
+        }
       }
     }
     last = esc.lastIndex;
@@ -209,6 +249,69 @@ function ansiToBBCode(line: string): string {
   out += line.slice(last);
   if (open) out += "[/COLOR]";
   return out;
+}
+
+// ─── Clipboard text helper ───────────────────────────────────────────────────
+
+async function copyTextToClipboard(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch { /* fall through */ }
+  // execCommand fallback — works without clipboard-write permission
+  const el = document.createElement("textarea");
+  el.value = text;
+  el.style.cssText = "position:fixed;left:-9999px;top:0;opacity:0";
+  document.body.appendChild(el);
+  el.focus();
+  el.select();
+  const ok = document.execCommand("copy");
+  document.body.removeChild(el);
+  return ok;
+}
+
+// ─── PNG rendering ────────────────────────────────────────────────────────────
+
+const ANSI_CANVAS_COLORS: Record<number, string> = {
+  30: "#555555", 31: "#cc0000", 32: "#00aa00", 33: "#aa5500",
+  34: "#0000cc", 35: "#aa00aa", 36: "#00aaaa", 37: "#aaaaaa",
+  90: "#555555", 91: "#ff5555", 92: "#55ff55", 93: "#ffff55",
+  94: "#5555ff", 95: "#ff55ff", 96: "#55ffff", 97: "#ffffff",
+};
+
+function renderAnsiLine(
+  ctx: CanvasRenderingContext2D,
+  line: string,
+  x: number,
+  y: number,
+  defaultColor: string,
+): void {
+  const esc = /\x1b\[([0-9;]*)m/g;
+  let last = 0, color = defaultColor;
+  let m: RegExpExecArray | null;
+  while ((m = esc.exec(line))) {
+    if (m.index > last) {
+      const seg = line.slice(last, m.index);
+      ctx.fillStyle = color;
+      ctx.fillText(seg, x, y);
+      x += ctx.measureText(seg).width;
+    }
+    last = esc.lastIndex;
+    const codes = m[1] ? m[1].split(";").map(Number) : [0];
+    if (codes[0] === 0) {
+      color = defaultColor;
+    } else if (codes[0] === 38 && codes[1] === 2 && codes.length >= 5) {
+      const h = (n: number) => Math.max(0, Math.min(255, n)).toString(16).padStart(2, "0");
+      color = `#${h(codes[2])}${h(codes[3])}${h(codes[4])}`;
+    } else {
+      const fg = codes.find(c => (c >= 30 && c <= 37) || (c >= 90 && c <= 97));
+      if (fg !== undefined) color = ANSI_CANVAS_COLORS[fg] ?? color;
+    }
+  }
+  if (last < line.length) {
+    ctx.fillStyle = color;
+    ctx.fillText(line.slice(last), x, y);
+  }
 }
 
 // ─── xterm helpers ───────────────────────────────────────────────────────────
@@ -305,9 +408,10 @@ interface RenderOpts {
   skipAll:    boolean;  // skip inline annotations + round summaries + fight summaries
   skipRounds: boolean;  // skip round summaries only (fight summary still shown)
   skipInline: boolean;  // skip inline damage annotations only
+  dslColors:  boolean;  // render DSL {x color codes as true color
 }
 
-const DEFAULT_OPTS: RenderOpts = { skipAll: false, skipRounds: false, skipInline: false };
+const DEFAULT_OPTS: RenderOpts = { skipAll: false, skipRounds: false, skipInline: false, dslColors: false };
 
 function newTracker(): DmgTracker {
   return { round: [], fight: [], lastDmgTs: null, hadRoundDmg: false };
@@ -345,7 +449,11 @@ function renderEntryTracked(
   tracker: DmgTracker,
   opts: RenderOpts = DEFAULT_OPTS,
 ): void {
-  const plain = stripAnsi(entry.text);
+  const isDslPlain = opts.dslColors && format === "plain";
+  const text = isDslPlain ? applyDslColors(entry.text) : entry.text;
+  const effectiveFormat: Format = isDslPlain ? "ansi" : format;
+
+  const plain = stripAnsi(text);
   const ts = entry.ts;
 
   // Timestamped gap checks (fire BEFORE writing the current line)
@@ -358,7 +466,7 @@ function renderEntryTracked(
     }
   }
 
-  const dmg = parseDmgLine(entry.text);
+  const dmg = parseDmgLine(text);
 
   if (dmg) {
     const src = dmgSource(plain, dmg.plainIndex);
@@ -369,8 +477,8 @@ function renderEntryTracked(
 
     const annotation = (opts.skipAll || opts.skipInline) ? "" : dmgAnnotation(dmg.value);
     let display: string;
-    if (format === "rawlog" || format === "ansi") {
-      display = entry.text + annotation;
+    if (effectiveFormat === "rawlog" || effectiveFormat === "ansi") {
+      display = text + annotation;
     } else {
       const col = dmgColor(dmg.value);
       display =
@@ -386,7 +494,7 @@ function renderEntryTracked(
         flushRound(t, tracker, !opts.skipAll && !opts.skipRounds);
       }
     }
-    const raw = (format === "rawlog" || format === "ansi") ? entry.text : colorize(entry.text);
+    const raw = (effectiveFormat === "rawlog" || effectiveFormat === "ansi") ? text : colorize(text);
     t.writeln(raw.length > 0 ? raw : " ");
   }
 }
@@ -422,9 +530,17 @@ const LogPasteViewer: FC = () => {
   const lastIdxRef   = useRef(0);
 
   // ── render options (checkboxes)
-  const [skipAll,    setSkipAll]    = useState(false);
-  const [skipRounds, setSkipRounds] = useState(false);
-  const [skipInline, setSkipInline] = useState(false);
+  const [skipAll,       setSkipAll]       = useState(false);
+  const [skipRounds,    setSkipRounds]    = useState(false);
+  const [skipInline,    setSkipInline]    = useState(false);
+  const [dslColorCodes, setDslColorCodes] = useState(false);
+
+  // ── copy feedback
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const markCopied = (key: string) => {
+    setCopiedKey(key);
+    setTimeout(() => setCopiedKey(null), 2000);
+  };
 
   // ── damage tracking refs (persist across incremental renders)
   const trackerRef    = useRef<DmgTracker>(newTracker());
@@ -510,23 +626,24 @@ const LogPasteViewer: FC = () => {
     t.clear();
     const tracker = newTracker();
     trackerRef.current = tracker;
-    const opts: RenderOpts = { skipAll, skipRounds, skipInline };
+    const opts: RenderOpts = { skipAll, skipRounds, skipInline, dslColors: dslColorCodes };
     for (const entry of parsed.entries) {
       renderEntryTracked(t, entry, parsed.format, tracker, opts);
     }
     flushFight(t, tracker, opts);
-  }, [parsed, skipAll, skipRounds, skipInline]);
+  }, [parsed, skipAll, skipRounds, skipInline, dslColorCodes]);
 
   // ── render entries up to current time (playback mode)
   useEffect(() => {
     if (!parsed?.hasTimestamps || !parsed.entries.length) return;
 
-    const opts: RenderOpts = { skipAll, skipRounds, skipInline };
+    const opts: RenderOpts = { skipAll, skipRounds, skipInline, dslColors: dslColorCodes };
     const prev = prevOptsRef.current;
     const optsChanged =
       opts.skipAll !== prev.skipAll ||
       opts.skipRounds !== prev.skipRounds ||
-      opts.skipInline !== prev.skipInline;
+      opts.skipInline !== prev.skipInline ||
+      opts.dslColors !== prev.dslColors;
     prevOptsRef.current = opts;
 
     const cutoffMs = time * 1000;
@@ -557,7 +674,7 @@ const LogPasteViewer: FC = () => {
     if (end !== parsed.entries.length) {
       endFlushedRef.current = false;
     }
-  }, [time, parsed, skipAll, skipRounds, skipInline]);
+  }, [time, parsed, skipAll, skipRounds, skipInline, dslColorCodes]);
 
   // ── copy / download helpers
 
@@ -586,58 +703,104 @@ const LogPasteViewer: FC = () => {
 
   const useRaw = (fmt: Format) => fmt === "rawlog" || fmt === "ansi";
 
-  const copyPlainText = () => {
-    if (!parsed) return;
-    const lines = parsed.entries.map(e =>
-      stripAnsi(useRaw(parsed.format) ? e.text : colorize(e.text))
-    );
-    safeWrite(lines.join("\n"), "log.txt");
+  const prepareText = (e: Entry): string => {
+    if (!parsed) return e.text;
+    if (useRaw(parsed.format)) return e.text;
+    if (dslColorCodes) return applyDslColors(e.text);
+    return colorize(e.text);
   };
 
-  const copyBBCode = () => {
+  const copyPlainText = async () => {
     if (!parsed) return;
-    const lines = parsed.entries.map(e =>
-      ansiToBBCode(useRaw(parsed.format) ? e.text : colorize(e.text))
-    );
-    safeWrite(lines.join("\n"), "log-bbcode.txt");
+    const lines = parsed.entries.map(e => {
+      if (dslColorCodes) return stripDslCodes(stripAnsi(e.text));
+      return stripAnsi(useRaw(parsed.format) ? e.text : colorize(e.text));
+    });
+    const text = lines.join("\n");
+    if (await copyTextToClipboard(text)) markCopied("plain");
+    else downloadFile(text, "log.txt");
+  };
+
+  const copyBBCode = async () => {
+    if (!parsed) return;
+    const text = parsed.entries.map(e => ansiToBBCode(prepareText(e))).join("\n");
+    if (await copyTextToClipboard(text)) markCopied("bbcode");
+    else downloadFile(text, "log-bbcode.txt");
   };
 
   const downloadBBCode = () => {
     if (!parsed) return;
-    const lines = parsed.entries.map(e =>
-      ansiToBBCode(useRaw(parsed.format) ? e.text : colorize(e.text))
-    );
+    const lines = parsed.entries.map(e => ansiToBBCode(prepareText(e)));
     downloadFile(lines.join("\n"), "log-bbcode.txt");
   };
 
   const copyHtml = async () => {
     if (!parsed) return;
-    const htmlLines = parsed.entries.map(e =>
-      ansiToHtml(useRaw(parsed.format) ? e.text : colorize(e.text))
-    );
+    const htmlLines = parsed.entries.map(e => ansiToHtml(prepareText(e)));
     const fragment = `<pre style="background:#111;color:#ccc;font-family:'Courier New',Courier,monospace;font-size:13px;line-height:1.4;padding:8px;white-space:pre-wrap">\n${htmlLines.join("\n")}\n</pre>`;
-    // Try rich-text clipboard (text/html MIME), allowing paste into HTML-aware editors
-    try {
-      if (typeof ClipboardItem !== "undefined") {
-        await navigator.clipboard.write([
-          new ClipboardItem({
-            "text/html":  new Blob([fragment],  { type: "text/html" }),
-            "text/plain": new Blob([fragment],  { type: "text/plain" }),
-          }),
-        ]);
-        return;
-      }
-    } catch { /* fall through */ }
-    // Fallback: copy HTML source as plain text, or download
-    await safeWrite(buildHtmlPage(htmlLines), "log.html");
+    if (await copyTextToClipboard(fragment)) markCopied("html");
+    else downloadFile(buildHtmlPage(htmlLines), "log.html", "text/html;charset=utf-8");
   };
 
   const downloadHtml = () => {
     if (!parsed) return;
-    const htmlLines = parsed.entries.map(e =>
-      ansiToHtml(useRaw(parsed.format) ? e.text : colorize(e.text))
-    );
+    const htmlLines = parsed.entries.map(e => ansiToHtml(prepareText(e)));
     downloadFile(buildHtmlPage(htmlLines), "log.html", "text/html;charset=utf-8");
+  };
+
+  // ── PNG export
+  const copyAsImage = () => {
+    if (!parsed) return;
+    const fontSize = 13;
+    const lineHeightPx = Math.round(fontSize * 1.5);
+    const paddingPx = 12;
+    const bgColor = "#111111";
+    const defaultColor = "#cccccc";
+    const fontSpec = `${fontSize}px "Courier New", Courier, monospace`;
+
+    const lines = parsed.entries.map(e => prepareText(e));
+    const plainLines = lines.map(l => stripAnsi(l));
+
+    const tmp = document.createElement("canvas");
+    const tmpCtx = tmp.getContext("2d")!;
+    tmpCtx.font = fontSpec;
+    const charW = tmpCtx.measureText("X").width;
+
+    const maxLen = Math.max(1, ...plainLines.map(l => l.length));
+    const canvasW = Math.ceil(maxLen * charW) + paddingPx * 2;
+    const canvasH = lines.length * lineHeightPx + paddingPx * 2;
+
+    const canvas = document.createElement("canvas");
+    canvas.width = canvasW;
+    canvas.height = canvasH;
+    const ctx = canvas.getContext("2d")!;
+
+    ctx.fillStyle = bgColor;
+    ctx.fillRect(0, 0, canvasW, canvasH);
+    ctx.font = fontSpec;
+    ctx.textBaseline = "top";
+
+    for (let i = 0; i < lines.length; i++) {
+      renderAnsiLine(ctx, lines[i], paddingPx, paddingPx + i * lineHeightPx, defaultColor);
+    }
+
+    canvas.toBlob(async blob => {
+      if (!blob) return;
+      let copied = false;
+      try {
+        await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+        copied = true;
+      } catch { /* fall through to download */ }
+      if (copied) {
+        markCopied("image");
+      } else {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url; a.download = "log.png";
+        document.body.appendChild(a); a.click();
+        setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 100);
+      }
+    }, "image/png");
   };
 
   // ── popup "show whole log"
@@ -661,7 +824,7 @@ const LogPasteViewer: FC = () => {
     ro.observe(el);
     w.addEventListener("beforeunload", () => ro.disconnect());
 
-    const opts: RenderOpts = { skipAll, skipRounds, skipInline };
+    const opts: RenderOpts = { skipAll, skipRounds, skipInline, dslColors: dslColorCodes };
     const popupTracker = newTracker();
     for (const entry of parsed.entries) {
       renderEntryTracked(t2, entry, parsed.format, popupTracker, opts);
@@ -716,12 +879,18 @@ const LogPasteViewer: FC = () => {
                 fontFamily: "monospace", fontSize: 11, padding: 4,
               }}
             />
-            <button
-              onClick={onPasteLoad}
-              style={{ background: "#3a5a3a", color: "#cfc", border: "1px solid #4a7a4a", padding: "4px 12px", cursor: "pointer" }}
-            >
-              Render
-            </button>
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              <button
+                onClick={onPasteLoad}
+                style={{ background: "#3a5a3a", color: "#cfc", border: "1px solid #4a7a4a", padding: "4px 12px", cursor: "pointer" }}
+              >
+                Render
+              </button>
+              <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "#bbb", cursor: "pointer", userSelect: "none" }}>
+                <input type="checkbox" checked={dslColorCodes} onChange={e => setDslColorCodes(e.target.checked)} style={{ cursor: "pointer" }} />
+                DSL color codes
+              </label>
+            </div>
           </div>
         )}
 
@@ -738,12 +907,13 @@ const LogPasteViewer: FC = () => {
         {/* Toolbar */}
         {hasData && (
           <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
-            <button onClick={showWholeLog}  style={btnStyle}>Show Whole Log</button>
-            <button onClick={copyHtml}      style={btnStyle}>Copy HTML</button>
-            <button onClick={downloadHtml}  style={btnStyle}>Download HTML</button>
-            <button onClick={copyBBCode}    style={btnStyle}>Copy BBCode</button>
+            <button onClick={showWholeLog}   style={btnStyle}>Show Whole Log</button>
+            <button onClick={copyHtml}       style={btnStyle}>{copiedKey === "html"   ? "✓ Copied!" : "Copy HTML"}</button>
+            <button onClick={downloadHtml}   style={btnStyle}>Download HTML</button>
+            <button onClick={copyBBCode}     style={btnStyle}>{copiedKey === "bbcode" ? "✓ Copied!" : "Copy BBCode"}</button>
             <button onClick={downloadBBCode} style={btnStyle}>Download BBCode</button>
-            <button onClick={copyPlainText} style={btnStyle}>Copy Plain Text</button>
+            <button onClick={copyPlainText}  style={btnStyle}>{copiedKey === "plain"  ? "✓ Copied!" : "Copy Plain Text"}</button>
+            <button onClick={copyAsImage}    style={btnStyle}>{copiedKey === "image"  ? "✓ Copied!" : "Copy as Image"}</button>
             <span style={{ marginLeft: 4, borderLeft: "1px solid #444", paddingLeft: 8, display: "flex", gap: 12, alignItems: "center" }}>
               {([
                 ["skipAll",    skipAll,    setSkipAll,    "Skip damage summaries"] as const,
