@@ -37,6 +37,17 @@ export const DAMAGE_VALUES: Record<string, number> = {
 // Sorted longest-first so "OBLITERATES" beats "OBLITERATE", etc.
 export const DAMAGE_KEYS_SORTED = Object.keys(DAMAGE_VALUES).sort((a, b) => b.length - a.length);
 
+// Condition/status phrase suffixes that contain a DAMAGE_VALUES keyword ("scratches"/"wounds")
+// but are health reports, not combat hits. Ported from opponent-buckets.ts and
+// self-condition-buckets.ts in apps/game-client/src/features/combat/ — only the tiers whose
+// wording collides with a damage keyword are needed here.
+export const CONDITION_SUFFIXES = [
+  'a few scratches.',                        // "<name> has a few scratches." / "You have a few scratches."
+  'some small wounds and bruises.',          // "... has/have some small wounds and bruises."
+  'quite a few wounds.',                     // "... has/have quite a few wounds."
+  'some big nasty wounds and scratches.',    // "... has/have some big nasty wounds and scratches."
+];
+
 const ANSI_RE = /\x1b\[[0-9;]*[A-Za-z]/g;
 export function stripAnsi(s: string): string { return s.replace(ANSI_RE, ''); }
 
@@ -61,9 +72,13 @@ export function parseDmgLine(line: string): ParsedDmg | null {
   const plain = stripAnsi(line);
   // Skip death/kill announcement lines where damage verbs appear in non-combat context
   if (/\bDEAD[.!]/.test(plain) || /\bhits the ground\b/.test(plain)) return null;
-  // Skip opponent health/gate descriptions matching OPPONENT_GATES patterns with damage keywords:
-  // "few scratches", "small wounds and bruises", "quite a few wounds", "big nasty wounds and scratches"
-  if (/\bhas\s+(?:a?\s*few\s+scratches|(?:quite\s+a\s+few|big\s+nasty|small)\s+wounds)/i.test(plain)) return null;
+  // Skip condition/status lines whose wording happens to contain a damage keyword.
+  // Literal suffixes ported from opponent-buckets.ts ("<name> has/is/looks ...") and
+  // self-condition-buckets.ts ("You have/are ...") — only the tiers that collide with
+  // a DAMAGE_VALUES key need listing here.
+  for (const suffix of CONDITION_SUFFIXES) {
+    if (plain.includes(suffix)) return null;
+  }
   // Skip spell/affect display lines ("modifies hit roll by N for N cycles")
   if (/\bmodifies\s+\w+\s+roll\b/i.test(plain)) return null;
   for (const key of DAMAGE_KEYS_SORTED) {
