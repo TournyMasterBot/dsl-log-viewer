@@ -1,2 +1,9 @@
+# pnpm 11 and 12 read their settings only from this file. Do not remove or lower minimumReleaseAge (value is in MINUTES: a package version must be a day old).
+minimumReleaseAge: 1440
+
+# esbuild (a dependency of vite) verifies its platform binary in a postinstall script; pnpm 11 and 12 fail an install that leaves a build script unapproved.
 allowBuilds:
   esbuild: true
+
+onlyBuiltDependencies:
+  - esbuild

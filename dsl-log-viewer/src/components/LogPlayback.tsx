@@ -125,6 +125,15 @@ function enableMiddleScroll(el: HTMLElement, t: Terminal): () => void {
   };
 }
 
+/* The lines of a raw record. A trailing newline ends the last line; it does not start another, empty
+   one. Splitting on the newline alone gave every record an extra blank line in the text / BBCode / HTML
+   exports, which the terminal view (it writes the record as is) never shows. */
+function recordLines(message: string): string[] {
+  const lines = message.split(/\r?\n/);
+  if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
+  return lines;
+}
+
 /* Strip the first leading "[ … ] " prefix, if present. */
 function normalizeActor(name: string): string {
   return (name || "").replace(/^\s*\[[^\]]*]\s*/, "");
@@ -516,7 +525,7 @@ const LogPlaybackXterm: FC = () => {
       const e = entries[idx];
       if (e.type === "raw") {
         const curTs = e.ts.getTime();
-        for (const rawLine of (e.message ?? "").split(/\r?\n/)) {
+        for (const rawLine of recordLines(e.message ?? "")) {
           const dmg = parseDmgLine(rawLine);
           if (dmg) {
             const plain = stripAnsi(rawLine);

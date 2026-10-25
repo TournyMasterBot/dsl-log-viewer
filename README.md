@@ -20,3 +20,19 @@ GMCP (Currently Ignored)
 * timestamp = ISO 8601 timestamp
 
 > Note: Shattered Archive logs using ANSI color codes, which come directly from DSL.
+
+# Cleaning a raw jsonl
+
+A raw game log has prompts, GMCP and repeated text. To get a small jsonl that keeps only what a hand-cleaned plain-text copy of it keeps (colors and timestamps included):
+
+```
+cd dsl-log-viewer
+pnpm clean-jsonl "<raw>.jsonl" "<clean>.txt" ["<out>.jsonl"] [--legacy-export]
+```
+
+* `<out>.jsonl` defaults to `<clean>.txt` with a `.jsonl` extension; an existing file is overwritten.
+* Every non-blank line of the clean text must exist in the raw log (the colors come from there); the script stops and lists any line that does not.
+* It replays the viewer over its own output (the text export and, by default, the terminal view) and exits with an error unless the result equals the clean text.
+* Load the result on the **JSONL Playback** tab and tick **Skip damage summaries** before using the Copy/Download buttons.
+* **Blank lines:** by default they are written as real blank lines, which needs a viewer build with `recordLines()` in `LogPlayback.tsx`. Older builds add an extra blank line after every record in the exports; for those pass `--legacy-export`, whose exports are right but whose on-screen terminal shows no blank lines between messages.
+* Details of the record shape are in the header of `dsl-log-viewer/scripts/build-clean-jsonl.mjs`.

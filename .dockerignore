@@ -1,0 +1,5 @@
+# The image installs its own dependencies and builds its own dist; host copies (pnpm symlinks) must never be copied over them.
+**/node_modules
+**/dist
+.git
+.vscode
